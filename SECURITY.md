@@ -1,10 +1,27 @@
 # Security
 
-## Reporting a vulnerability
+## Coordinated Vulnerability Disclosure & Bug Bounty Program
 
-Please do not open public issues for security problems. Use a GitHub
-private security advisory on this repository instead. We acknowledge reports
-within 72 hours.
+Zenith operates an active, rewarded **Bug Bounty Program** for the custody-bearing Vault Stack, Smart Contracts, Backend APIs, and Frontend Web Application.
+
+- **Intake:** Submit reports via a **GitHub Private Security Advisory** on this repository or email encrypted reports to `security@zenith-options.org`.
+- **Maximum Reward:** **$25,000 USD / USDC** for Critical findings affecting user collateral or contract custody.
+- **Detailed Program Specification:** See [`docs/security/bug-bounty-program.md`](docs/security/bug-bounty-program.md) for full scope, asset inventory, reward tiers, and upgrade tracking.
+- **Triage Runbook:** Responders follow [`docs/security/triage-runbook.md`](docs/security/triage-runbook.md).
+
+### Response & Triage SLAs
+
+| Step | SLA Window | Commitment |
+|---|---|---|
+| **Initial Acknowledgment** | ≤ 24 Hours | First human response confirming receipt of report |
+| **Triage & Severity Score** | ≤ 72 Hours | Validation, CVSS 3.1 rating, and bounty eligibility assessment |
+| **Patch & Remediation** | ≤ 14 Days | Development, testing, and deployment of hotfix |
+| **Bounty Settlement** | ≤ 7 Days | Payout via USDC upon verified patch deployment |
+| **Public Disclosure** | 90 Calendar Days | Coordinated release of security advisory post-fix |
+
+### Safe Harbour Guarantee
+
+Zenith considers security research conducted under the [Bug Bounty Program](docs/security/bug-bounty-program.md) to be **authorized, legal, and protected**. We will not pursue civil action or initiate legal complaints against researchers acting in good faith who respect user privacy, avoid service disruption, and adhere to coordinated disclosure guidelines.
 
 ---
 
