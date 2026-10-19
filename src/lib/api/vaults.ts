@@ -15,7 +15,29 @@
  *   → VaultDetail
  *
  *   POST /api/v1/vaults/{id}/deposit   { amount: number }  → { tx_id: string }
- *   POST /api/v1/vaults/{id}/withdraw  { shares: number }  → { tx_id: string; queued: boolean }
+ *   POST /api/v1/vaults/{id}/withdraw  { shares: number }  → { tx_id: string; queued: boolean; request_id: string }
+ *   POST /api/v1/vaults/{id}/withdrawals/{request_id}/cancel → { returned_shares: number }
+ *
+ * Withdrawal queue semantics (mock implements these; the live contract must match):
+ *
+ *   - Request: shares are escrowed on request. Escrowed shares stay in totalShares
+ *     (so NAV per share is unaffected by the queue) but cannot be requested again.
+ *   - Ordering: requests are served by (request epoch, then seq). Requests from an
+ *     earlier epoch are always served first. `seq` is a monotonic tie-break assigned
+ *     at request time. Unfilled requests keep their epoch, seq and requestedAt.
+ *   - Fill: each epoch cohort is valued at the processing NAV. If the remaining
+ *     liquidity covers the cohort, every request fills 100%. If it does not, every
+ *     request in that cohort fills the same pro-rata fraction, and later cohorts get
+ *     nothing this pass. `fillFraction` is recorded per request.
+ *   - Processing: a keeper calls `processWithdrawalQueue` at an epoch boundary with the
+ *     NAV per share and liquidity at that point. At most MAX_COHORTS_PER_PASS cohorts
+ *     are examined per call. Filled shares leave totalShares and the user's shares.
+ *   - Settlement NAV: a processed request pays out at the NAV passed to the keeper,
+ *     not the NAV at request time.
+ *   - Cancellation: only requests still in the queue can be cancelled. The escrow that
+ *     remains is returned in full. Any part already filled stays paid out.
+ *   - Pause: not modeled in the mock. The intended rule is that a paused vault blocks new
+ *     requests but still processes queued ones.
  */
 
 export type VaultStrategy = "covered_call" | "cash_secured_put" | "iron_condor" | "wheel";
@@ -61,7 +83,38 @@ export interface UserVaultPosition {
   shareValue: number; // current USD value per share
   totalValue: number;
   accruedPremium: number;
-  pendingWithdrawal: number; // shares queued for withdrawal at epoch end
+  pendingWithdrawal: number; // shares escrowed in unprocessed withdrawal requests
+}
+
+export type WithdrawalStatus = "queued" | "processed" | "cancelled";
+
+/** One redemption request in a vault's withdrawal queue. */
+export interface WithdrawalRequest {
+  id: string;
+  vaultId: string;
+  /** Epoch the request was made in. Earlier epochs are served first. */
+  requestEpoch: number;
+  /** Monotonic tie-break within an epoch, assigned at request time. */
+  seq: number;
+  /** ISO time of the original request. Kept when unfilled requests carry forward. */
+  requestedAt: string;
+  requestedShares: number;
+  /** Shares still escrowed and not yet redeemed. */
+  escrowedShares: number;
+  filledShares: number;
+  /** filledShares / requestedShares, 0–1. Updated on every processing pass. */
+  fillFraction: number;
+  /** USD paid out, summed over every pass at that pass's processing NAV. */
+  payoutUsd: number;
+  status: WithdrawalStatus;
+}
+
+/** State of the vault at the point where the withdrawal queue is processed. */
+export interface ProcessingPoint {
+  /** NAV per share at processing. Requests settle at this price. */
+  navPerShare: number;
+  /** USD of liquid capital available to pay out. */
+  liquidityUsd: number;
 }
 
 /** Full detail for a single vault. */
@@ -193,6 +246,75 @@ const MOCK_VAULTS: VaultDetail[] = [
 ];
 
 // ---------------------------------------------------------------------------
+// Withdrawal queue (mock state)
+// ---------------------------------------------------------------------------
+
+/** Append-only. Status changes in place; entries are never removed. */
+const WITHDRAWAL_QUEUE: WithdrawalRequest[] = [];
+let nextWithdrawalSeq = 1;
+
+/** Max epoch cohorts examined per keeper call, so a large queue cannot block. */
+const MAX_COHORTS_PER_PASS = 10;
+
+function escrowedShares(vaultId: string): number {
+  return WITHDRAWAL_QUEUE
+    .filter(r => r.vaultId === vaultId && r.status === "queued")
+    .reduce((sum, r) => sum + r.escrowedShares, 0);
+}
+
+/**
+ * Keeper entry point. Call at an epoch boundary with the NAV and liquidity at that point.
+ * Serves queued requests by (requestEpoch, seq). Each epoch cohort is filled whole
+ * when liquidity covers it. Otherwise every request in that cohort gets the same
+ * pro-rata fraction and later cohorts wait for the next pass. Returns the requests
+ * whose state changed.
+ */
+export function processWithdrawalQueue(vaultId: string, point: ProcessingPoint): WithdrawalRequest[] {
+  const vault = MOCK_VAULTS.find(v => v.id === vaultId);
+  if (!vault?.userPosition) return [];
+  if (!(point.navPerShare > 0)) throw new Error("Processing NAV must be positive");
+
+  const queued = WITHDRAWAL_QUEUE
+    .filter(r => r.vaultId === vaultId && r.status === "queued")
+    .sort((a, b) => a.requestEpoch - b.requestEpoch || a.seq - b.seq);
+
+  const cohorts: WithdrawalRequest[][] = [];
+  for (const r of queued) {
+    const last = cohorts[cohorts.length - 1];
+    if (last && last[0].requestEpoch === r.requestEpoch) last.push(r);
+    else cohorts.push([r]);
+  }
+
+  const touched: WithdrawalRequest[] = [];
+  let liquidity = point.liquidityUsd;
+  let redeemedShares = 0;
+  for (const cohort of cohorts.slice(0, MAX_COHORTS_PER_PASS)) {
+    if (liquidity <= 0) break;
+    const cohortValue = cohort.reduce((sum, r) => sum + r.escrowedShares * point.navPerShare, 0);
+    const fraction = Math.min(1, liquidity / cohortValue);
+    for (const r of cohort) {
+      const shares = r.escrowedShares * fraction;
+      r.escrowedShares -= shares;
+      r.filledShares += shares;
+      r.payoutUsd += shares * point.navPerShare;
+      r.fillFraction = r.filledShares / r.requestedShares;
+      if (r.escrowedShares <= 1e-9) {
+        r.escrowedShares = 0;
+        r.status = "processed";
+      }
+      redeemedShares += shares;
+      touched.push(r);
+    }
+    liquidity -= cohortValue * fraction;
+  }
+
+  // Redeemed shares leave the supply. Escrowed-but-unfilled shares stay in it.
+  vault.userPosition.shares -= redeemedShares;
+  vault.totalShares -= redeemedShares;
+  return touched;
+}
+
+// ---------------------------------------------------------------------------
 // Public adapter
 // ---------------------------------------------------------------------------
 
@@ -209,7 +331,10 @@ export async function fetchVaultDetail(id: string, _token?: string | null): Prom
     // TODO: return apiGet<VaultDetail>(`/api/v1/vaults/${id}`, token);
     throw new Error("Live vaults API not yet implemented");
   }
-  return Promise.resolve(MOCK_VAULTS.find(v => v.id === id) ?? null);
+  const vault = MOCK_VAULTS.find(v => v.id === id);
+  if (!vault) return Promise.resolve(null);
+  const userPosition = vault.userPosition && { ...vault.userPosition, pendingWithdrawal: escrowedShares(id) };
+  return Promise.resolve({ ...vault, userPosition });
 }
 
 export async function depositToVault(
@@ -230,11 +355,48 @@ export async function withdrawFromVault(
   id: string,
   shares: number,
   _token: string
-): Promise<{ tx_id: string; queued: boolean }> {
+): Promise<{ tx_id: string; queued: boolean; request_id: string }> {
   if (process.env.NEXT_PUBLIC_VAULTS === "live") {
-    // TODO: return apiPost<{tx_id:string;queued:boolean}>(`/api/v1/vaults/${id}/withdraw`, { shares }, token);
+    // TODO: return apiPost<{tx_id:string;queued:boolean;request_id:string}>(`/api/v1/vaults/${id}/withdraw`, { shares }, token);
     throw new Error("Live vaults API not yet implemented");
   }
   await new Promise(r => setTimeout(r, 600));
-  return { tx_id: `mock-tx-withdraw-${id}-${shares.toFixed(0)}-${Date.now()}`, queued: true };
+  const vault = MOCK_VAULTS.find(v => v.id === id);
+  if (!vault?.userPosition) throw new Error("No position in this vault");
+  if (!(shares > 0)) throw new Error("Shares must be positive");
+  // Escrowed shares are already counted against the position, so they cannot be requested twice.
+  const available = vault.userPosition.shares - escrowedShares(id);
+  if (shares > available) throw new Error(`Only ${available} shares available to withdraw`);
+
+  const request: WithdrawalRequest = {
+    id: `wd-${nextWithdrawalSeq}`,
+    vaultId: id,
+    requestEpoch: vault.currentEpoch,
+    seq: nextWithdrawalSeq++,
+    requestedAt: new Date().toISOString(),
+    requestedShares: shares,
+    escrowedShares: shares,
+    filledShares: 0,
+    fillFraction: 0,
+    payoutUsd: 0,
+    status: "queued",
+  };
+  WITHDRAWAL_QUEUE.push(request);
+  return { tx_id: `mock-tx-withdraw-${id}-${shares.toFixed(0)}-${Date.now()}`, queued: true, request_id: request.id };
+}
+
+export async function cancelWithdrawal(requestId: string, _token: string): Promise<{ returned_shares: number }> {
+  if (process.env.NEXT_PUBLIC_VAULTS === "live") {
+    // TODO: return apiPost<{returned_shares:number}>(`/api/v1/vaults/{id}/withdrawals/${requestId}/cancel`, {}, token);
+    throw new Error("Live vaults API not yet implemented");
+  }
+  await new Promise(r => setTimeout(r, 600));
+  const request = WITHDRAWAL_QUEUE.find(r => r.id === requestId);
+  if (!request) throw new Error(`Unknown withdrawal request ${requestId}`);
+  if (request.status !== "queued") throw new Error("Only queued withdrawals can be cancelled");
+  // Escrow is released. Any part already filled was paid out and is not reversed.
+  const returned = request.escrowedShares;
+  request.escrowedShares = 0;
+  request.status = "cancelled";
+  return { returned_shares: returned };
 }
