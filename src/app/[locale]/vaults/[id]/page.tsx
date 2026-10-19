@@ -5,11 +5,14 @@ import Link from "next/link";
 import { use } from "react";
 import { AppHeader } from "../../../../components/AppHeader";
 import { WalletConnect } from "../../../../components/WalletConnect";
+import { VaultAnalyticsPanel } from "../../../../components/VaultAnalyticsPanel";
 import { useWalletStore } from "../../../../lib/store/wallet";
 import {
   fetchVaultDetail,
+  fetchVaultAnalytics,
   depositToVault,
   withdrawFromVault,
+  type VaultAnalytics,
   type VaultDetail,
   type EpochPhase,
 } from "../../../../lib/api/vaults";
@@ -45,6 +48,8 @@ export default function VaultDetailPage({ params }: { params: Promise<{ id: stri
   const token = useWalletStore(s => s.session);
 
   const [vault, setVault] = useState<VaultDetail | null>(null);
+  const [analytics, setAnalytics] = useState<VaultAnalytics | null>(null);
+  const [analyticsError, setAnalyticsError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
@@ -58,6 +63,9 @@ export default function VaultDetailPage({ params }: { params: Promise<{ id: stri
     fetchVaultDetail(id, token)
       .then(v => { setVault(v); setLoading(false); })
       .catch(e => { setError(e.message); setLoading(false); });
+    fetchVaultAnalytics(id)
+      .then(a => { setAnalytics(a); setAnalyticsError(null); })
+      .catch(e => { setAnalytics(null); setAnalyticsError(e.message); });
   }, [id, token]);
 
   const handleDeposit = async () => {
@@ -171,6 +179,17 @@ export default function VaultDetailPage({ params }: { params: Promise<{ id: stri
                       </div>
                     ))}
                   </div>
+                </div>
+
+                {/* Performance analytics */}
+                <div>
+                  <div style={{ fontSize: 11, fontWeight: 600, color: "var(--text-hi)", marginBottom: 12 }}>Performance Analytics</div>
+                  {analyticsError && (
+                    <div style={{ padding: "12px 16px", border: "1px solid var(--put)", background: "var(--put-dim)", color: "var(--put)", fontSize: 12 }}>
+                      {analyticsError}
+                    </div>
+                  )}
+                  {analytics && <VaultAnalyticsPanel analytics={analytics} />}
                 </div>
 
                 {/* Epoch timeline */}

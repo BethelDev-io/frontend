@@ -14,6 +14,9 @@
  *   GET /api/v1/vaults/{id}
  *   → VaultDetail
  *
+ *   GET /api/v1/vaults/{id}/analytics
+ *   → VaultAnalytics
+ *
  *   POST /api/v1/vaults/{id}/deposit   { amount: number }  → { tx_id: string }
  *   POST /api/v1/vaults/{id}/withdraw  { shares: number }  → { tx_id: string; queued: boolean }
  */
@@ -75,6 +78,64 @@ export interface VaultDetail extends VaultSummary {
   payoffExplanation: string;
   historicalEpochs: EpochRecord[];
   userPosition: UserVaultPosition | null;
+}
+
+/** Attribution legs, one per strategy building block that moves NAV. */
+export type AttributionLeg = "covered_call_premium" | "csp_premium" | "condor_credit" | "wheel_assignment";
+
+/** NAV-per-share at an epoch boundary, as computed by the contract's NAV math. */
+export interface NavPoint {
+  epochNumber: number;
+  date: string; // ISO date of the epoch-end mark
+  navPerShare: number;
+  /** True when the point is an epoch rollover marker. */
+  epochEnd: boolean;
+  /** True when the backend has only partial data for this point (indexer backfill). */
+  partial: boolean;
+  /** Set when a fee event reset NAV; the discontinuity is not a loss. */
+  feeEvent: boolean;
+}
+
+/** Premium collected per epoch, sourced from the epoch ledger. */
+export interface PremiumPoint {
+  epochNumber: number;
+  premiumPerShare: number; // USD
+  feesPerShare: number; // USD
+  cumulativeFeesPerShare: number; // USD
+}
+
+/** Realised return over a trailing window, as reported by the backend. */
+export interface RealisedYield {
+  window: "last_epoch" | "last_4_epochs" | "since_inception";
+  /** Cumulative return over the window (0–1). Null when the backend cannot compute it. */
+  value: number | null;
+}
+
+/** Forward-looking estimate. Only present when the backend provides one. */
+export interface ProjectedYield {
+  value: number; // annualised (0–1)
+  methodology: string;
+}
+
+export interface AttributionShare {
+  leg: AttributionLeg;
+  /** Contribution to the vault's cumulative return (0–1, may be negative). */
+  contribution: number;
+}
+
+/** Precomputed analytics series for the depositor-facing vault analytics surface. */
+export interface VaultAnalytics {
+  vaultId: string;
+  dataFrom: string | null; // ISO date; null when the vault has no epochs
+  dataTo: string | null;
+  refreshedAt: string; // ISO timestamp of the last backend refresh
+  /** True when any series is backfilled or incomplete. */
+  partialData: boolean;
+  navHistory: NavPoint[];
+  premiums: PremiumPoint[];
+  realisedYield: RealisedYield[];
+  projectedYield: ProjectedYield | null;
+  attribution: AttributionShare[];
 }
 
 // ---------------------------------------------------------------------------
@@ -210,6 +271,61 @@ export async function fetchVaultDetail(id: string, _token?: string | null): Prom
     throw new Error("Live vaults API not yet implemented");
   }
   return Promise.resolve(MOCK_VAULTS.find(v => v.id === id) ?? null);
+}
+
+/**
+ * Mock analytics derived from each vault's historical epochs. NAV is chained
+ * from the epoch return; the live backend supplies these series directly.
+ */
+function mockAnalytics(v: VaultDetail): VaultAnalytics {
+  const epochs = [...v.historicalEpochs].sort((a, b) => a.epochNumber - b.epochNumber);
+  const perfFee = v.feeStructure.performancePct / 100;
+  let nav = 1;
+  let cumFees = 0;
+  const navHistory: NavPoint[] = [];
+  const premiums: PremiumPoint[] = [];
+  for (const ep of epochs) {
+    nav *= 1 + ep.pnlPct;
+    navHistory.push({ epochNumber: ep.epochNumber, date: ep.settlementDate, navPerShare: nav, epochEnd: true, partial: false, feeEvent: false });
+    const fee = Math.max(0, ep.pnlPct) * perfFee * nav;
+    cumFees += fee;
+    premiums.push({ epochNumber: ep.epochNumber, premiumPerShare: ep.premiumCollected, feesPerShare: fee, cumulativeFeesPerShare: cumFees });
+  }
+  const last = epochs[epochs.length - 1];
+  const compound = (eps: EpochRecord[]) => eps.reduce((acc, ep) => acc * (1 + ep.pnlPct), 1) - 1;
+  const attribution: AttributionShare[] =
+    v.strategy === "covered_call" ? [{ leg: "covered_call_premium", contribution: compound(epochs) }]
+    : v.strategy === "cash_secured_put" ? [{ leg: "csp_premium", contribution: compound(epochs) }]
+    : v.strategy === "iron_condor" ? [{ leg: "condor_credit", contribution: compound(epochs) }]
+    : [
+        { leg: "csp_premium", contribution: compound(epochs.filter(ep => ep.outcome === "expired_worthless")) },
+        { leg: "wheel_assignment", contribution: compound(epochs.filter(ep => ep.outcome === "exercised")) },
+      ];
+  return {
+    vaultId: v.id,
+    dataFrom: epochs.length ? epochs[0].activeStart : null,
+    dataTo: last ? last.settlementDate : null,
+    refreshedAt: "2026-10-03T12:00:00Z",
+    partialData: false,
+    navHistory,
+    premiums,
+    realisedYield: [
+      { window: "last_epoch", value: last ? last.pnlPct : null },
+      { window: "last_4_epochs", value: epochs.length ? compound(epochs.slice(-4)) : null },
+      { window: "since_inception", value: epochs.length ? compound(epochs) : null },
+    ],
+    projectedYield: v.id === "sol-wheel-v1" ? null : { value: v.apy, methodology: v.apyMethodology },
+    attribution,
+  };
+}
+
+export async function fetchVaultAnalytics(id: string): Promise<VaultAnalytics | null> {
+  if (process.env.NEXT_PUBLIC_VAULTS === "live") {
+    // TODO: return apiGet<VaultAnalytics>(`/api/v1/vaults/${id}/analytics`);
+    throw new Error("Live vaults API not yet implemented");
+  }
+  const vault = MOCK_VAULTS.find(v => v.id === id);
+  return Promise.resolve(vault ? mockAnalytics(vault) : null);
 }
 
 export async function depositToVault(
