@@ -14,9 +14,16 @@
  *   GET /api/v1/vaults/{id}
  *   → VaultDetail
  *
- *   POST /api/v1/vaults/{id}/deposit   { amount: number }  → { tx_id: string }
+ *   POST /api/v1/vaults/{id}/deposit   { amount: number, wallet_address }  → { xdr: string }
+ *     The backend builds the unsigned deposit transaction (amounts, NAV and
+ *     caps are computed server-side). The client only signs and submits it.
+ *     Rejections carry `code`: vault_paused | vault_at_capacity | below_minimum.
  *   POST /api/v1/vaults/{id}/withdraw  { shares: number }  → { tx_id: string; queued: boolean }
  */
+
+import freighterApi from "@stellar/freighter-api";
+import { apiPost, type RequestOptions } from "./client";
+import { submitTransactionXdr } from "./stellar";
 
 export type VaultStrategy = "covered_call" | "cash_secured_put" | "iron_condor" | "wheel";
 export type RiskRating = "low" | "medium" | "high";
@@ -212,14 +219,49 @@ export async function fetchVaultDetail(id: string, _token?: string | null): Prom
   return Promise.resolve(MOCK_VAULTS.find(v => v.id === id) ?? null);
 }
 
+/** Reasons the backend rejects a deposit, mapped to user-facing copy. */
+const DEPOSIT_REJECTION_MESSAGES: Record<string, string> = {
+  vault_paused: "This vault is paused. Deposits are disabled until it resumes.",
+  vault_at_capacity: "This vault is at capacity. Try a smaller amount or wait for space to open up.",
+  below_minimum: "This deposit is below the vault's minimum. Increase the amount and try again.",
+};
+
+export interface DepositOptions extends RequestOptions {
+  /** Connected Freighter address that signs and funds the deposit. */
+  address: string;
+}
+
+/**
+ * Deposits `amount` into vault `id`. The backend builds the unsigned
+ * transaction (NAV and caps are checked there); Freighter signs it and it is
+ * submitted. Nothing is recorded client-side, so a rejected or dropped
+ * transaction leaves no position behind — the caller re-fetches the vault on
+ * success to reconcile with the backend.
+ */
 export async function depositToVault(
   id: string,
   amount: number,
-  _token: string
+  token: string,
+  opts: DepositOptions
 ): Promise<{ tx_id: string }> {
   if (process.env.NEXT_PUBLIC_VAULTS === "live") {
-    // TODO: return apiPost<{tx_id:string}>(`/api/v1/vaults/${id}/deposit`, { amount }, token);
-    throw new Error("Live vaults API not yet implemented");
+    let built: { xdr: string };
+    try {
+      built = await apiPost<{ xdr: string }>(
+        `/api/v1/vaults/${id}/deposit`,
+        { amount, wallet_address: opts.address },
+        token,
+        undefined,
+        { idempotencyKey: opts.idempotencyKey }
+      );
+    } catch (e) {
+      const code = (e as { code?: string }).code;
+      if (code && DEPOSIT_REJECTION_MESSAGES[code]) throw new Error(DEPOSIT_REJECTION_MESSAGES[code]);
+      throw e;
+    }
+    const signed = await freighterApi.signTransaction(built.xdr, { accountToSign: opts.address });
+    const { hash } = await submitTransactionXdr(signed);
+    return { tx_id: hash };
   }
   // Mock: simulate a 600ms network round-trip
   await new Promise(r => setTimeout(r, 600));

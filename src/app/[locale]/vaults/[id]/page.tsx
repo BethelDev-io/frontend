@@ -6,6 +6,7 @@ import { use } from "react";
 import { AppHeader } from "../../../../components/AppHeader";
 import { WalletConnect } from "../../../../components/WalletConnect";
 import { useWalletStore } from "../../../../lib/store/wallet";
+import { useIdempotencyKey } from "../../../../lib/hooks/useIdempotencyKey";
 import {
   fetchVaultDetail,
   depositToVault,
@@ -42,7 +43,9 @@ function fmtDateShort(iso: string) {
 
 export default function VaultDetailPage({ params }: { params: Promise<{ id: string }> }) {
   const { id } = use(params);
-  const token = useWalletStore(s => s.session);
+  const token = useWalletStore(s => s.token);
+  const address = useWalletStore(s => s.address);
+  const { keyFor, complete } = useIdempotencyKey();
 
   const [vault, setVault] = useState<VaultDetail | null>(null);
   const [loading, setLoading] = useState(true);
@@ -61,16 +64,22 @@ export default function VaultDetailPage({ params }: { params: Promise<{ id: stri
   }, [id, token]);
 
   const handleDeposit = async () => {
-    if (!vault || !token) return;
+    if (!vault || !token || !address) return;
     const amount = parseFloat(depositAmount);
     if (isNaN(amount) || amount <= 0) return;
     setTxStatus("pending");
     setTxMessage("");
     try {
-      const result = await depositToVault(vault.id, amount, token);
+      const result = await depositToVault(vault.id, amount, token, {
+        address,
+        idempotencyKey: keyFor({ vault: vault.id, amount }),
+      });
+      complete();
       setTxStatus("success");
       setTxMessage(`Deposit confirmed. TX: ${result.tx_id}`);
       setDepositAmount("");
+      // Reconcile the displayed position with backend truth.
+      fetchVaultDetail(id, token).then(v => v && setVault(v)).catch(() => {});
     } catch (e) {
       setTxStatus("error");
       setTxMessage(e instanceof Error ? e.message : "Deposit failed");
