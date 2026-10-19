@@ -22,6 +22,26 @@ export type VaultStrategy = "covered_call" | "cash_secured_put" | "iron_condor" 
 export type RiskRating = "low" | "medium" | "high";
 export type EpochPhase = "deposit" | "active" | "settlement";
 
+/**
+ * Per-vault roles. Each vault is its own tenant boundary: a holder of a role
+ * on one vault has no implicit authority over any other vault.
+ *
+ * - depositor: may deposit and withdraw/redeem
+ * - operator: may set strategy parameters and roll epochs
+ * - guardian: may pause new deposits and new epochs only (never unpause or change parameters)
+ * - emergency_authority: protocol-level emergency authority, scoped to this vault
+ */
+export type VaultRole = "depositor" | "operator" | "guardian" | "emergency_authority";
+
+/** One role assignment on a vault. */
+export interface VaultRoleGrant {
+  role: VaultRole;
+  /** Account address of the role holder. */
+  holder: string;
+  /** ISO timestamp of when the role was granted. */
+  grantedAt: string;
+}
+
 /** Summary shown on the /vaults listing page. */
 export interface VaultSummary {
   id: string;
@@ -75,6 +95,8 @@ export interface VaultDetail extends VaultSummary {
   payoffExplanation: string;
   historicalEpochs: EpochRecord[];
   userPosition: UserVaultPosition | null;
+  /** Role assignments scoped to this vault only. */
+  roles: VaultRoleGrant[];
 }
 
 // ---------------------------------------------------------------------------
@@ -100,6 +122,11 @@ const MOCK_VAULTS: VaultDetail[] = [
     phaseEndsAt: "2026-10-03T16:00:00Z",
     sharePrice: 1.042,
     totalShares: 272552,
+    roles: [
+      { role: "operator", holder: "GXLMCC_OPERATOR_MOCK", grantedAt: "2026-01-15T00:00:00Z" },
+      { role: "guardian", holder: "GXLMCC_GUARDIAN_MOCK", grantedAt: "2026-01-15T00:00:00Z" },
+      { role: "emergency_authority", holder: "GPROTOCOL_EMERGENCY_MOCK", grantedAt: "2026-01-15T00:00:00Z" },
+    ],
     feeStructure: { managementPct: 0, performancePct: 10 },
     payoffExplanation: "Each week the vault sells a call option at a strike ~10% above the current XLM price. If XLM stays below the strike, depositors keep the full premium. If XLM rallies above the strike, the position is exercised and depositors participate in the upside up to the strike, giving up gains beyond it.",
     historicalEpochs: [
@@ -129,6 +156,11 @@ const MOCK_VAULTS: VaultDetail[] = [
     phaseEndsAt: "2026-10-17T20:00:00Z",
     sharePrice: 1.088,
     totalShares: 1700368,
+    roles: [
+      { role: "operator", holder: "GBTCCSP_OPERATOR_MOCK", grantedAt: "2026-02-01T00:00:00Z" },
+      { role: "guardian", holder: "GBTCCSP_GUARDIAN_MOCK", grantedAt: "2026-02-01T00:00:00Z" },
+      { role: "emergency_authority", holder: "GPROTOCOL_EMERGENCY_MOCK", grantedAt: "2026-02-01T00:00:00Z" },
+    ],
     feeStructure: { managementPct: 0.5, performancePct: 15 },
     payoffExplanation: "Each month the vault sells a put option at a strike ~10% below the current BTC price, backed by USDC. If BTC stays above the strike, depositors keep the premium. If BTC falls below the strike, the vault is assigned and acquires BTC at the strike — a risk equivalent to a limit buy order.",
     historicalEpochs: [
@@ -156,6 +188,11 @@ const MOCK_VAULTS: VaultDetail[] = [
     phaseEndsAt: "2026-09-28T12:00:00Z",
     sharePrice: 1.021,
     totalShares: 607247,
+    roles: [
+      { role: "operator", holder: "GETHIC_OPERATOR_MOCK", grantedAt: "2026-02-15T00:00:00Z" },
+      { role: "guardian", holder: "GETHIC_GUARDIAN_MOCK", grantedAt: "2026-02-15T00:00:00Z" },
+      { role: "emergency_authority", holder: "GPROTOCOL_EMERGENCY_MOCK", grantedAt: "2026-02-15T00:00:00Z" },
+    ],
     feeStructure: { managementPct: 0, performancePct: 10 },
     payoffExplanation: "The vault simultaneously sells an out-of-the-money call spread and a put spread on ETH. Maximum profit is the combined net premium, achieved if ETH expires between the two short strikes. Maximum loss is limited to the spread width minus the premium.",
     historicalEpochs: [
@@ -182,6 +219,11 @@ const MOCK_VAULTS: VaultDetail[] = [
     phaseEndsAt: "2026-09-28T16:00:00Z",
     sharePrice: 1.194,
     totalShares: 82076,
+    roles: [
+      { role: "operator", holder: "GSOLWHEEL_OPERATOR_MOCK", grantedAt: "2026-03-01T00:00:00Z" },
+      { role: "guardian", holder: "GSOLWHEEL_GUARDIAN_MOCK", grantedAt: "2026-03-01T00:00:00Z" },
+      { role: "emergency_authority", holder: "GPROTOCOL_EMERGENCY_MOCK", grantedAt: "2026-03-01T00:00:00Z" },
+    ],
     feeStructure: { managementPct: 0, performancePct: 20 },
     payoffExplanation: "The wheel alternates between selling puts (aiming to buy SOL at a discount) and covered calls (aiming to sell at a premium). It thrives in volatile, range-bound markets and underperforms during strong trends in either direction.",
     historicalEpochs: [
@@ -201,7 +243,7 @@ export async function fetchVaults(): Promise<VaultSummary[]> {
     // TODO: return apiGet<VaultSummary[]>("/api/v1/vaults");
     throw new Error("Live vaults API not yet implemented");
   }
-  return Promise.resolve(MOCK_VAULTS.map(({ historicalEpochs, userPosition, ...summary }) => summary));
+  return Promise.resolve(MOCK_VAULTS.map(({ historicalEpochs, userPosition, roles, ...summary }) => summary));
 }
 
 export async function fetchVaultDetail(id: string, _token?: string | null): Promise<VaultDetail | null> {
