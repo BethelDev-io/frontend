@@ -1,8 +1,10 @@
 /**
  * Typed data adapter interface for the Vaults feature.
  *
- * The vault smart contracts and backend API are not yet available.
- * When NEXT_PUBLIC_VAULTS=mock (or the env var is absent), the mock
+ * The Phase 2 options vault contract is scaffolded under `contracts/vault`
+ * (crate `zenith-options-vault`), but it is not yet deployed and the backend
+ * API is not yet available. This module is unrelated to the margin-collateral
+ * vault in `./vault.ts`. When NEXT_PUBLIC_VAULTS=mock (or the env var is absent), the mock
  * implementation below is used. Swap in the real implementation by
  * setting NEXT_PUBLIC_VAULTS=live and implementing `fetchVaultsLive`.
  *
