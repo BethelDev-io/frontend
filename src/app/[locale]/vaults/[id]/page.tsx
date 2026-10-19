@@ -6,12 +6,15 @@ import { use } from "react";
 import { AppHeader } from "../../../../components/AppHeader";
 import { WalletConnect } from "../../../../components/WalletConnect";
 import { useWalletStore } from "../../../../lib/store/wallet";
+import { downloadBlob } from "../../../../lib/csv";
 import {
   fetchVaultDetail,
   depositToVault,
   withdrawFromVault,
+  fetchVaultExport,
   type VaultDetail,
   type EpochPhase,
+  type VaultExportFormat,
 } from "../../../../lib/api/vaults";
 
 const PHASE_LABELS: Record<EpochPhase, string> = {
@@ -95,6 +98,17 @@ export default function VaultDetailPage({ params }: { params: Promise<{ id: stri
     } catch (e) {
       setTxStatus("error");
       setTxMessage(e instanceof Error ? e.message : "Withdrawal failed");
+    }
+  };
+
+  const handleExport = async (format: VaultExportFormat) => {
+    if (!vault || !token) return;
+    try {
+      const blob = await fetchVaultExport(vault.id, format, token);
+      downloadBlob(`${vault.id}-lots.${format}`, blob);
+    } catch (e) {
+      setTxStatus("error");
+      setTxMessage(e instanceof Error ? e.message : "Export failed");
     }
   };
 
@@ -288,6 +302,19 @@ export default function VaultDetailPage({ params }: { params: Promise<{ id: stri
                         <span className="num" style={{ fontSize: 11, fontWeight: 600, color: "var(--text-hi)" }}>{s.value}</span>
                       </div>
                     ))}
+                    <div style={{ display: "flex", gap: 8, marginTop: 12 }}>
+                      {(["csv", "json"] as const).map(format => (
+                        <button
+                          key={format}
+                          type="button"
+                          onClick={() => handleExport(format)}
+                          disabled={!token}
+                          style={{ flex: 1, padding: "6px 0", fontSize: 11, fontWeight: 600, border: "1px solid var(--brand)", background: "transparent", color: "var(--brand)", cursor: token ? "pointer" : "not-allowed" }}
+                        >
+                          Export {format.toUpperCase()}
+                        </button>
+                      ))}
+                    </div>
                   </div>
                 )}
 

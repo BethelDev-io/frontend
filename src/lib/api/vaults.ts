@@ -18,7 +18,9 @@
  *   POST /api/v1/vaults/{id}/withdraw  { shares: number }  → { tx_id: string; queued: boolean }
  */
 
-export type VaultStrategy = "covered_call" | "cash_secured_put" | "iron_condor" | "wheel";
+import { toCsv, type CsvColumn } from "../csv";
+
+export type VaultStrategy ="covered_call" | "cash_secured_put" | "iron_condor" | "wheel";
 export type RiskRating = "low" | "medium" | "high";
 export type EpochPhase = "deposit" | "active" | "settlement";
 
@@ -76,6 +78,204 @@ export interface VaultDetail extends VaultSummary {
   historicalEpochs: EpochRecord[];
   userPosition: UserVaultPosition | null;
 }
+
+// ---------------------------------------------------------------------------
+// Share-lot accounting (cost basis, realized and unrealized PnL)
+//
+// Shared by the API and any client-side display. Rebuilding the ledger from
+// the same event stream always yields the same output: events are ordered by
+// (ledger, seq) and lots by (acquiredLedger, lotId). Schema: docs/vault-lot-ledger.md
+// ---------------------------------------------------------------------------
+
+/** Lot relief method. Stored on every ledger row so a future change cannot rewrite history. */
+export type LotReliefMethod = "fifo";
+export const DEFAULT_LOT_RELIEF_METHOD: LotReliefMethod = "fifo";
+
+/** Share amounts at or below this are rounding residue, never a lot. */
+export const DUST_SHARES = 1e-9;
+
+/** A dated acquisition lot held by one depositor in one vault. */
+export interface VaultShareLot {
+  lotId: string;
+  vaultId: string;
+  acquiredLedger: number;
+  acquiredAt: string; // ledger close time (ISO), never receipt time
+  /** Shares still held from this lot. */
+  shares: number;
+  /** Cost basis still attached to the remaining shares, in USD. */
+  costUsd: number;
+  /** NAV per share used when the shares were minted. */
+  navPerShare: number;
+}
+
+/** A lot-affecting event as indexed from the vault contract. */
+export interface VaultLotEvent {
+  seq: number;
+  kind: "deposit" | "transfer_in" | "redemption" | "transfer_out";
+  ledger: number;
+  ledgerAt: string;
+  vaultId: string;
+  shares: number;
+  /** deposit/transfer_in: cost in USD. redemption/transfer_out: gross proceeds in USD. */
+  amountUsd: number;
+  /** Fees that reduce proceeds. Management fees are already reflected in NAV and are not repeated here. */
+  feesUsd: number;
+  navPerShare: number;
+}
+
+/** One ledger row per lot-affecting event. This is the export row. */
+export interface VaultLedgerRow {
+  seq: number;
+  kind: VaultLotEvent["kind"];
+  ledger: number;
+  ledgerAt: string;
+  vaultId: string;
+  shares: number;
+  amountUsd: number;
+  feesUsd: number;
+  navPerShare: number;
+  costBasisUsd: number;
+  realizedPnlUsd: number;
+  lotMethod: LotReliefMethod;
+}
+
+export interface LotRelief {
+  shares: number;
+  costBasisUsd: number;
+  /** Gross proceeds minus fees. */
+  netProceedsUsd: number;
+  realizedPnlUsd: number;
+  consumed: { lotId: string; shares: number; costUsd: number }[];
+  remainingLots: VaultShareLot[];
+}
+
+function byLotOrder(a: VaultShareLot, b: VaultShareLot): number {
+  return a.acquiredLedger - b.acquiredLedger || a.lotId.localeCompare(b.lotId);
+}
+
+/**
+ * Relieves `shares` from the lots in FIFO order and returns the realized PnL.
+ * Throws rather than producing a negative basis when `shares` exceeds the tracked lots.
+ */
+export function relieveLotsFifo(
+  lots: VaultShareLot[],
+  shares: number,
+  grossProceedsUsd: number,
+  feesUsd: number
+): LotRelief {
+  if (!(shares > DUST_SHARES)) throw new Error(`Relief quantity must be positive, got ${shares}`);
+  if (feesUsd < 0) throw new Error(`Fees cannot be negative, got ${feesUsd}`);
+  const available = lots.reduce((sum, lot) => sum + lot.shares, 0);
+  if (shares > available + DUST_SHARES) {
+    throw new Error(`Cannot relieve ${shares} shares: only ${available} tracked`);
+  }
+
+  let remaining = shares;
+  let costBasisUsd = 0;
+  const consumed: LotRelief["consumed"] = [];
+  const remainingLots: VaultShareLot[] = [];
+
+  for (const lot of [...lots].sort(byLotOrder)) {
+    if (remaining <= DUST_SHARES) {
+      remainingLots.push(lot);
+      continue;
+    }
+    const take = Math.min(lot.shares, remaining);
+    const costUsd = lot.shares > 0 ? lot.costUsd * (take / lot.shares) : 0;
+    remaining -= take;
+    costBasisUsd += costUsd;
+    consumed.push({ lotId: lot.lotId, shares: take, costUsd });
+
+    const left = lot.shares - take;
+    if (left > DUST_SHARES) {
+      remainingLots.push({ ...lot, shares: left, costUsd: lot.costUsd - costUsd });
+    }
+  }
+
+  const netProceedsUsd = grossProceedsUsd - feesUsd;
+  return {
+    shares,
+    costBasisUsd,
+    netProceedsUsd,
+    realizedPnlUsd: netProceedsUsd - costBasisUsd,
+    consumed,
+    remainingLots,
+  };
+}
+
+/** Unrealized PnL on the lots still held, marked at `markNavPerShare`. */
+export function unrealizedPnl(lots: VaultShareLot[], markNavPerShare: number): number {
+  return lots.reduce((sum, lot) => sum + (lot.shares * markNavPerShare - lot.costUsd), 0);
+}
+
+/**
+ * Replays lot-affecting events into lots and ledger rows.
+ * Deterministic: the same events always produce the same rows and lots.
+ */
+export function buildLotLedger(events: VaultLotEvent[]): { rows: VaultLedgerRow[]; lots: VaultShareLot[] } {
+  const ordered = [...events].sort((a, b) => a.ledger - b.ledger || a.seq - b.seq);
+  let lots: VaultShareLot[] = [];
+  const rows: VaultLedgerRow[] = [];
+
+  for (const ev of ordered) {
+    const base = {
+      seq: ev.seq,
+      kind: ev.kind,
+      ledger: ev.ledger,
+      ledgerAt: ev.ledgerAt,
+      vaultId: ev.vaultId,
+      shares: ev.shares,
+      amountUsd: ev.amountUsd,
+      feesUsd: ev.feesUsd,
+      navPerShare: ev.navPerShare,
+      lotMethod: DEFAULT_LOT_RELIEF_METHOD,
+    };
+
+    if (ev.kind === "deposit" || ev.kind === "transfer_in") {
+      // Dust minted from rounding never becomes a lot.
+      if (ev.shares > DUST_SHARES) {
+        lots.push({
+          lotId: `${ev.vaultId}:${ev.seq}`,
+          vaultId: ev.vaultId,
+          acquiredLedger: ev.ledger,
+          acquiredAt: ev.ledgerAt,
+          shares: ev.shares,
+          costUsd: ev.amountUsd,
+          navPerShare: ev.navPerShare,
+        });
+      }
+      rows.push({ ...base, costBasisUsd: ev.amountUsd, realizedPnlUsd: 0 });
+      continue;
+    }
+
+    const relief = relieveLotsFifo(lots, ev.shares, ev.amountUsd, ev.feesUsd);
+    lots = relief.remainingLots;
+    rows.push({ ...base, costBasisUsd: relief.costBasisUsd, realizedPnlUsd: relief.realizedPnlUsd });
+  }
+
+  return { rows, lots: [...lots].sort(byLotOrder) };
+}
+
+/** Export schema version. Bump on any column change. */
+export const VAULT_EXPORT_SCHEMA_VERSION = 1;
+
+export type VaultExportFormat = "csv" | "json";
+
+export const VAULT_EXPORT_COLUMNS: CsvColumn<VaultLedgerRow>[] = [
+  { header: "schema_version", value: () => VAULT_EXPORT_SCHEMA_VERSION },
+  { header: "seq", value: r => r.seq },
+  { header: "event_kind", value: r => r.kind },
+  { header: "ledger", value: r => r.ledger },
+  { header: "ledger_at", value: r => r.ledgerAt },
+  { header: "vault_id", value: r => r.vaultId },
+  { header: "shares", value: r => r.shares },
+  { header: "amount_usd", value: r => r.amountUsd },
+  { header: "fees_usd", value: r => r.feesUsd },
+  { header: "nav_per_share", value: r => r.navPerShare },
+  { header: "cost_basis_usd", value: r => r.costBasisUsd },
+  { header: "realized_pnl_usd", value: r => r.realizedPnlUsd },
+  { header: "lot_method", value: r => r.lotMethod },
+];
 
 // ---------------------------------------------------------------------------
 // Mock data
@@ -237,4 +437,32 @@ export async function withdrawFromVault(
   }
   await new Promise(r => setTimeout(r, 600));
   return { tx_id: `mock-tx-withdraw-${id}-${shares.toFixed(0)}-${Date.now()}`, queued: true };
+}
+
+/**
+ * Downloads the caller's full lot history for one vault.
+ * Live: GET /api/v1/vaults/{id}/export?format=csv|json, served by the backend
+ * and authorized to the authenticated depositor only.
+ */
+export async function fetchVaultExport(
+  id: string,
+  format: VaultExportFormat,
+  _token: string
+): Promise<Blob> {
+  if (process.env.NEXT_PUBLIC_VAULTS === "live") {
+    // TODO: stream from /api/v1/vaults/${id}/export?format=${format} with the session token
+    throw new Error("Live vaults API not yet implemented");
+  }
+  // Mock: no lot events exist yet, so the export is the header-only schema.
+  const { rows } = buildLotLedger([]);
+  if (format === "csv") {
+    return new Blob([toCsv(rows, VAULT_EXPORT_COLUMNS)], { type: "text/csv" });
+  }
+  const body = {
+    schema_version: VAULT_EXPORT_SCHEMA_VERSION,
+    vault_id: id,
+    lot_method: DEFAULT_LOT_RELIEF_METHOD,
+    rows,
+  };
+  return new Blob([JSON.stringify(body, null, 2)], { type: "application/json" });
 }
