@@ -4,7 +4,7 @@ import { useEffect, useState } from "react";
 import Link from "next/link";
 import { AppHeader } from "../../../components/AppHeader";
 import { WalletConnect } from "../../../components/WalletConnect";
-import { fetchVaults, type VaultSummary, type VaultStrategy, type RiskRating } from "../../../lib/api/vaults";
+import { fetchVaults, vaultStatusPolicy, type VaultSummary, type VaultStrategy, type RiskRating } from "../../../lib/api/vaults";
 
 const STRATEGY_LABELS: Record<VaultStrategy, string> = {
   covered_call:      "Covered Call",
@@ -155,6 +155,12 @@ export default function VaultsPage() {
                           border: `1px solid ${RISK_COLORS[vault.riskRating]}`,
                         }}>
                           {vault.riskRating} risk
+                        </span>
+                        <span style={{
+                          fontSize: 10, padding: "2px 8px", marginLeft: 6, textTransform: "uppercase", letterSpacing: "0.06em",
+                          border: "1px solid var(--border-default)", color: "var(--text-mid)",
+                        }}>
+                          {vaultStatusPolicy(vault.status).label}
                         </span>
                       </div>
                     </div>
