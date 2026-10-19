@@ -98,14 +98,14 @@ export function VolSmile({ baseVol, width = 260, height = 110 }: VolSmileProps) 
 
           {/* Smile curve */}
           <path d={data.path} fill="none"
-            stroke="#B59665" strokeWidth={1.5}
+            style={{ stroke: "var(--atm)" }} strokeWidth={1.5}
             strokeLinecap="round" strokeLinejoin="round"
             clipPath="url(#smile-clip)"
           />
 
           {/* ATM dot */}
           <circle cx={data.atmX} cy={data.atmY} r={3}
-            fill="var(--bg-elevated)" stroke="#B59665" strokeWidth={1.5}
+            fill="var(--bg-elevated)" style={{ stroke: "var(--atm)" }} strokeWidth={1.5}
           />
 
           {/* Y labels */}
