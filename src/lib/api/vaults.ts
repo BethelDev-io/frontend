@@ -1,10 +1,13 @@
+import { apiGet, apiPost } from "./client";
+
 /**
  * Typed data adapter interface for the Vaults feature.
  *
  * The vault smart contracts and backend API are not yet available.
  * When NEXT_PUBLIC_VAULTS=mock (or the env var is absent), the mock
  * implementation below is used. Swap in the real implementation by
- * setting NEXT_PUBLIC_VAULTS=live and implementing `fetchVaultsLive`.
+ * setting NEXT_PUBLIC_VAULTS=live, which calls the backend vault registry
+ * (Zenith-options/backend) through the REST contract below.
  *
  * Backend contract (for when the real API lands):
  *
@@ -198,16 +201,14 @@ const MOCK_VAULTS: VaultDetail[] = [
 
 export async function fetchVaults(): Promise<VaultSummary[]> {
   if (process.env.NEXT_PUBLIC_VAULTS === "live") {
-    // TODO: return apiGet<VaultSummary[]>("/api/v1/vaults");
-    throw new Error("Live vaults API not yet implemented");
+    return apiGet<VaultSummary[]>("/api/v1/vaults");
   }
   return Promise.resolve(MOCK_VAULTS.map(({ historicalEpochs, userPosition, ...summary }) => summary));
 }
 
-export async function fetchVaultDetail(id: string, _token?: string | null): Promise<VaultDetail | null> {
+export async function fetchVaultDetail(id: string, token?: string | null): Promise<VaultDetail | null> {
   if (process.env.NEXT_PUBLIC_VAULTS === "live") {
-    // TODO: return apiGet<VaultDetail>(`/api/v1/vaults/${id}`, token);
-    throw new Error("Live vaults API not yet implemented");
+    return apiGet<VaultDetail>(`/api/v1/vaults/${encodeURIComponent(id)}`, token);
   }
   return Promise.resolve(MOCK_VAULTS.find(v => v.id === id) ?? null);
 }
@@ -215,11 +216,10 @@ export async function fetchVaultDetail(id: string, _token?: string | null): Prom
 export async function depositToVault(
   id: string,
   amount: number,
-  _token: string
+  token: string
 ): Promise<{ tx_id: string }> {
   if (process.env.NEXT_PUBLIC_VAULTS === "live") {
-    // TODO: return apiPost<{tx_id:string}>(`/api/v1/vaults/${id}/deposit`, { amount }, token);
-    throw new Error("Live vaults API not yet implemented");
+    return apiPost<{ tx_id: string }>(`/api/v1/vaults/${encodeURIComponent(id)}/deposit`, { amount }, token);
   }
   // Mock: simulate a 600ms network round-trip
   await new Promise(r => setTimeout(r, 600));
@@ -229,11 +229,14 @@ export async function depositToVault(
 export async function withdrawFromVault(
   id: string,
   shares: number,
-  _token: string
+  token: string
 ): Promise<{ tx_id: string; queued: boolean }> {
   if (process.env.NEXT_PUBLIC_VAULTS === "live") {
-    // TODO: return apiPost<{tx_id:string;queued:boolean}>(`/api/v1/vaults/${id}/withdraw`, { shares }, token);
-    throw new Error("Live vaults API not yet implemented");
+    return apiPost<{ tx_id: string; queued: boolean }>(
+      `/api/v1/vaults/${encodeURIComponent(id)}/withdraw`,
+      { shares },
+      token
+    );
   }
   await new Promise(r => setTimeout(r, 600));
   return { tx_id: `mock-tx-withdraw-${id}-${shares.toFixed(0)}-${Date.now()}`, queued: true };
