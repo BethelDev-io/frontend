@@ -18,6 +18,7 @@ import { NetworkMismatchBanner } from "../../components/NetworkMismatchBanner";
 import { SorobanEventBridge } from "../../components/SorobanEventBridge";
 import { CommandLayer } from "../../components/command/CommandLayer";
 import { TransactionTracker } from "../../components/TransactionTracker";
+import { A11yRoot } from "../../components/a11y/A11yRoot";
 
 const fraunces = Fraunces({
   subsets: ["latin"], weight: ["400","500","600","700"],
@@ -90,6 +91,7 @@ export default async function LocaleLayout({ children, params }: { children: Rea
     <html lang={locale} className={`${fraunces.variable} ${plexSans.variable} ${jetbrainsMono.variable}`}>
       <body>
         <NextIntlClientProvider locale={locale} messages={messages} timeZone="UTC">
+          <A11yRoot />
           <StoreHydrator />
           <Toaster />
           <SessionBanner />
