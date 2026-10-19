@@ -5,6 +5,7 @@ import Link from "next/link";
 import { AppHeader } from "../../../components/AppHeader";
 import { WalletConnect } from "../../../components/WalletConnect";
 import { fetchVaults, type VaultSummary, type VaultStrategy, type RiskRating } from "../../../lib/api/vaults";
+import { useFlag } from "../../../lib/flags";
 
 const STRATEGY_LABELS: Record<VaultStrategy, string> = {
   covered_call:      "Covered Call",
@@ -44,12 +45,13 @@ export default function VaultsPage() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [apyTooltip, setApyTooltip] = useState<string | null>(null);
+  const vaultsEnabled = useFlag("vaults");
 
   useEffect(() => {
-    fetchVaults()
+    fetchVaults({ enabled: vaultsEnabled })
       .then(v => { setVaults(v); setLoading(false); })
       .catch(e => { setError(e.message); setLoading(false); });
-  }, []);
+  }, [vaultsEnabled]);
 
   return (
     <div style={{ display: "flex", flexDirection: "column", height: "100vh", background: "var(--bg)", overflow: "hidden", fontFamily: "var(--font-sans)" }}>
@@ -117,6 +119,10 @@ export default function VaultsPage() {
                 }}>Close</button>
               </div>
             </div>
+          )}
+
+          {!loading && !error && !vaultsEnabled && vaults.length === 0 && (
+            <div style={{ fontSize: 13, color: "var(--text-mid)" }}>Vaults are not yet available.</div>
           )}
 
           {/* Vault cards */}

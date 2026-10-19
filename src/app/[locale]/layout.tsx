@@ -18,6 +18,8 @@ import { NetworkMismatchBanner } from "../../components/NetworkMismatchBanner";
 import { SorobanEventBridge } from "../../components/SorobanEventBridge";
 import { CommandLayer } from "../../components/command/CommandLayer";
 import { TransactionTracker } from "../../components/TransactionTracker";
+import { FlagsProvider, resolveAllFlags } from "../../lib/flags";
+import { fetchRemoteConfig } from "../../lib/flags/fetchRemoteConfig";
 
 const fraunces = Fraunces({
   subsets: ["latin"], weight: ["400","500","600","700"],
@@ -86,26 +88,33 @@ export default async function LocaleLayout({ children, params }: { children: Rea
     console.warn("[csp] no x-nonce request header — is src/middleware.ts running for this route?");
   }
 
+  // Flags are resolved here so SSR and the first client render agree; the
+  // provider swaps to live resolution after hydration.
+  const remoteConfig = await fetchRemoteConfig();
+  const initialFlags = resolveAllFlags({ remoteConfig, allowQueryOverride: false });
+
   return (
     <html lang={locale} className={`${fraunces.variable} ${plexSans.variable} ${jetbrainsMono.variable}`}>
       <body>
         <NextIntlClientProvider locale={locale} messages={messages} timeZone="UTC">
-          <StoreHydrator />
-          <Toaster />
-          <SessionBanner />
-          <ContractErrorOverlay />
-          <QueryProvider>
-            <SpotFeedProvider>
-              <BackendDataProvider>
-                <NetworkMismatchBanner />
-                <SorobanEventBridge>
-                  <CommandLayer>{children}</CommandLayer>
-                </SorobanEventBridge>
-              </BackendDataProvider>
-              <PwaShell />
-            </SpotFeedProvider>
-          </QueryProvider>
-          <TransactionTracker />
+          <FlagsProvider initialFlags={initialFlags} initialRemoteConfig={remoteConfig}>
+            <StoreHydrator />
+            <Toaster />
+            <SessionBanner />
+            <ContractErrorOverlay />
+            <QueryProvider>
+              <SpotFeedProvider>
+                <BackendDataProvider>
+                  <NetworkMismatchBanner />
+                  <SorobanEventBridge>
+                    <CommandLayer>{children}</CommandLayer>
+                  </SorobanEventBridge>
+                </BackendDataProvider>
+                <PwaShell />
+              </SpotFeedProvider>
+            </QueryProvider>
+            <TransactionTracker />
+          </FlagsProvider>
         </NextIntlClientProvider>
       </body>
     </html>

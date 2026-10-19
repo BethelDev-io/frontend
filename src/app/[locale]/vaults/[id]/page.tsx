@@ -6,6 +6,7 @@ import { use } from "react";
 import { AppHeader } from "../../../../components/AppHeader";
 import { WalletConnect } from "../../../../components/WalletConnect";
 import { useWalletStore } from "../../../../lib/store/wallet";
+import { useFlag } from "../../../../lib/flags";
 import {
   fetchVaultDetail,
   depositToVault,
@@ -43,6 +44,7 @@ function fmtDateShort(iso: string) {
 export default function VaultDetailPage({ params }: { params: Promise<{ id: string }> }) {
   const { id } = use(params);
   const token = useWalletStore(s => s.session);
+  const vaultsEnabled = useFlag("vaults");
 
   const [vault, setVault] = useState<VaultDetail | null>(null);
   const [loading, setLoading] = useState(true);
@@ -55,10 +57,10 @@ export default function VaultDetailPage({ params }: { params: Promise<{ id: stri
   const [activeFlow, setActiveFlow] = useState<"deposit" | "withdraw" | null>(null);
 
   useEffect(() => {
-    fetchVaultDetail(id, token)
+    fetchVaultDetail(id, token, { enabled: vaultsEnabled })
       .then(v => { setVault(v); setLoading(false); })
       .catch(e => { setError(e.message); setLoading(false); });
-  }, [id, token]);
+  }, [id, token, vaultsEnabled]);
 
   const handleDeposit = async () => {
     if (!vault || !token) return;
@@ -67,7 +69,7 @@ export default function VaultDetailPage({ params }: { params: Promise<{ id: stri
     setTxStatus("pending");
     setTxMessage("");
     try {
-      const result = await depositToVault(vault.id, amount, token);
+      const result = await depositToVault(vault.id, amount, token, { enabled: vaultsEnabled });
       setTxStatus("success");
       setTxMessage(`Deposit confirmed. TX: ${result.tx_id}`);
       setDepositAmount("");
@@ -129,7 +131,11 @@ export default function VaultDetailPage({ params }: { params: Promise<{ id: stri
             </div>
           )}
 
-          {!loading && !error && !vault && (
+          {!loading && !error && !vault && !vaultsEnabled && (
+            <div style={{ fontSize: 13, color: "var(--text-mid)" }}>Vaults are not yet available.</div>
+          )}
+
+          {!loading && !error && !vault && vaultsEnabled && (
             <div style={{ fontSize: 13, color: "var(--text-lo)" }}>Vault not found.</div>
           )}
 
@@ -315,7 +321,7 @@ export default function VaultDetailPage({ params }: { params: Promise<{ id: stri
                   <div style={{ border: "1px solid var(--border-default)", background: "var(--bg-raised)" }}>
                     {/* Tab switcher */}
                     <div style={{ display: "flex", borderBottom: "1px solid var(--border-default)" }}>
-                      {(["deposit", "withdraw"] as const).map(flow => (
+                      {(vaultsEnabled ? ["deposit", "withdraw"] : ["withdraw"] as const).map(flow => (
                         <button key={flow} onClick={() => { setActiveFlow(activeFlow === flow ? null : flow); setTxStatus(null); }}
                           style={{
                             flex: 1, padding: "10px 0", border: "none", cursor: "pointer",
@@ -330,7 +336,7 @@ export default function VaultDetailPage({ params }: { params: Promise<{ id: stri
                       ))}
                     </div>
 
-                    {activeFlow === "deposit" && (
+                    {activeFlow === "deposit" && vaultsEnabled && (
                       <div style={{ padding: 16 }}>
                         <div style={{ fontSize: 11, color: "var(--text-mid)", marginBottom: 12 }}>
                           Deposit USDC into the vault. Shares are issued at the current NAV of{" "}

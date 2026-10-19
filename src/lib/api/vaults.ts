@@ -193,39 +193,68 @@ const MOCK_VAULTS: VaultDetail[] = [
 ];
 
 // ---------------------------------------------------------------------------
+// Rollout gate
+// ---------------------------------------------------------------------------
+
+/**
+ * Rollout state for the `vaults` flag, supplied by every caller.
+ *
+ * The adapter is the enforcement point, so one check covers list, detail,
+ * and deposit. `enabled: false` (kill switch) stops new deposits and hides
+ * vaults the user has no position in. It never hides a position: history and
+ * withdrawals stay available to existing depositors. See
+ * docs/feature-flag-rollout.md.
+ */
+export interface VaultAccess {
+  enabled: boolean;
+}
+
+// ---------------------------------------------------------------------------
 // Public adapter
 // ---------------------------------------------------------------------------
 
-export async function fetchVaults(): Promise<VaultSummary[]> {
+// The mock has no wallet, so `userPosition` stands in for "this user holds a position".
+
+export async function fetchVaults(access: VaultAccess): Promise<VaultSummary[]> {
   if (process.env.NEXT_PUBLIC_VAULTS === "live") {
     // TODO: return apiGet<VaultSummary[]>("/api/v1/vaults");
     throw new Error("Live vaults API not yet implemented");
   }
-  return Promise.resolve(MOCK_VAULTS.map(({ historicalEpochs, userPosition, ...summary }) => summary));
+  const visible = access.enabled ? MOCK_VAULTS : MOCK_VAULTS.filter(v => v.userPosition !== null);
+  return Promise.resolve(visible.map(({ historicalEpochs, userPosition, ...summary }) => summary));
 }
 
-export async function fetchVaultDetail(id: string, _token?: string | null): Promise<VaultDetail | null> {
+export async function fetchVaultDetail(
+  id: string,
+  _token: string | null | undefined,
+  access: VaultAccess
+): Promise<VaultDetail | null> {
   if (process.env.NEXT_PUBLIC_VAULTS === "live") {
     // TODO: return apiGet<VaultDetail>(`/api/v1/vaults/${id}`, token);
     throw new Error("Live vaults API not yet implemented");
   }
-  return Promise.resolve(MOCK_VAULTS.find(v => v.id === id) ?? null);
+  const vault = MOCK_VAULTS.find(v => v.id === id) ?? null;
+  if (vault && !access.enabled && vault.userPosition === null) return Promise.resolve(null);
+  return Promise.resolve(vault);
 }
 
 export async function depositToVault(
   id: string,
   amount: number,
-  _token: string
+  _token: string,
+  access: VaultAccess
 ): Promise<{ tx_id: string }> {
   if (process.env.NEXT_PUBLIC_VAULTS === "live") {
     // TODO: return apiPost<{tx_id:string}>(`/api/v1/vaults/${id}/deposit`, { amount }, token);
     throw new Error("Live vaults API not yet implemented");
   }
+  if (!access.enabled) throw new Error("Vault deposits are not yet available");
   // Mock: simulate a 600ms network round-trip
   await new Promise(r => setTimeout(r, 600));
   return { tx_id: `mock-tx-deposit-${id}-${amount.toFixed(0)}-${Date.now()}` };
 }
 
+// Never gated: queued redemptions must stay processable when the flag is off.
 export async function withdrawFromVault(
   id: string,
   shares: number,
