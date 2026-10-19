@@ -21,6 +21,8 @@
 export type VaultStrategy = "covered_call" | "cash_secured_put" | "iron_condor" | "wheel";
 export type RiskRating = "low" | "medium" | "high";
 export type EpochPhase = "deposit" | "active" | "settlement";
+/** `full` is derived from TVL vs. capacity in `effectiveStatus`; the backend may also report it. */
+export type VaultStatus = "open" | "paused" | "closed_to_deposits" | "full";
 
 /** Summary shown on the /vaults listing page. */
 export interface VaultSummary {
@@ -40,6 +42,204 @@ export interface VaultSummary {
   currentExpiry: string; // ISO date
   riskRating: RiskRating;
   description: string;
+  status: VaultStatus;
+  /** Epoch length (tenor) in days. */
+  epochDays: number;
+  /** Fees as whole percentages, e.g. performancePct: 10 = 10%. */
+  feeStructure: { managementPct: number; performancePct: number };
+  /** Worst peak-to-trough drawdown (0–1). Null until the vault has enough settled epochs. */
+  maxDrawdownPct: number | null;
+}
+
+// ---------------------------------------------------------------------------
+// Listing query: filter + sort state, shared by the index and compare views.
+// Parsed from and serialized to URL search params, so views are shareable.
+// ---------------------------------------------------------------------------
+
+export const VAULT_SORT_KEYS = ["apy", "utilization", "tvl", "drawdown", "fees"] as const;
+export type VaultSortKey = (typeof VAULT_SORT_KEYS)[number];
+export type VaultSortDir = "asc" | "desc";
+
+export const VAULT_STRATEGY_LABELS: Record<VaultStrategy, string> = {
+  covered_call:      "Covered Call",
+  cash_secured_put:  "Cash-Secured Put",
+  iron_condor:       "Iron Condor",
+  wheel:             "Wheel",
+};
+
+export const VAULT_STATUS_LABELS: Record<VaultStatus, string> = {
+  open:               "Open",
+  paused:             "Paused",
+  closed_to_deposits: "Closed to deposits",
+  full:               "Full",
+};
+
+export const VAULT_RISK_LABELS: Record<RiskRating, string> = {
+  low:    "Low",
+  medium: "Medium",
+  high:   "High",
+};
+
+export const VAULT_SORT_LABELS: Record<VaultSortKey, string> = {
+  apy:         "APY",
+  utilization: "Capacity used",
+  tvl:         "TVL",
+  drawdown:    "Max drawdown",
+  fees:        "Fees",
+};
+
+/** Maximum vaults that can be placed side by side on the compare view. */
+export const VAULT_COMPARE_MAX = 4;
+
+export interface VaultQuery {
+  strategy: VaultStrategy | null;
+  underlying: string | null;
+  status: VaultStatus | null;
+  risk: RiskRating | null;
+  /** Epoch length in days. */
+  tenor: number | null;
+  sort: VaultSortKey;
+  dir: VaultSortDir;
+  /** Vault ids selected for comparison. */
+  ids: string[];
+}
+
+export const DEFAULT_VAULT_QUERY: VaultQuery = {
+  strategy: null,
+  underlying: null,
+  status: null,
+  risk: null,
+  tenor: null,
+  sort: "apy",
+  dir: "desc",
+  ids: [],
+};
+
+function pickOne<T extends string>(raw: string | null, allowed: readonly T[]): T | null {
+  return raw !== null && (allowed as readonly string[]).includes(raw) ? (raw as T) : null;
+}
+
+/** Parses a comma-separated id list, dropping blanks and duplicates and capping at VAULT_COMPARE_MAX. */
+export function parseVaultIds(raw: string | null): string[] {
+  if (!raw) return [];
+  const ids = raw.split(",").map(s => s.trim()).filter(Boolean);
+  return [...new Set(ids)].slice(0, VAULT_COMPARE_MAX);
+}
+
+/**
+ * Reads the query from URL search params. Unknown or malformed values degrade
+ * to defaults rather than throwing. `knownUnderlyings` is the set present in the
+ * loaded data, so a stale or hand-typed underlying is ignored.
+ */
+export function parseVaultQuery(
+  source: { get(name: string): string | null },
+  knownUnderlyings: readonly string[] = []
+): VaultQuery {
+  const underlying = source.get("underlying");
+  const tenor = Number(source.get("tenor"));
+  return {
+    strategy: pickOne(source.get("strategy"), Object.keys(VAULT_STRATEGY_LABELS) as VaultStrategy[]),
+    underlying: underlying && knownUnderlyings.includes(underlying) ? underlying : null,
+    status: pickOne(source.get("status"), Object.keys(VAULT_STATUS_LABELS) as VaultStatus[]),
+    risk: pickOne(source.get("risk"), Object.keys(VAULT_RISK_LABELS) as RiskRating[]),
+    tenor: Number.isInteger(tenor) && tenor > 0 ? tenor : null,
+    sort: pickOne(source.get("sort"), VAULT_SORT_KEYS) ?? DEFAULT_VAULT_QUERY.sort,
+    dir: pickOne(source.get("dir"), ["asc", "desc"] as const) ?? DEFAULT_VAULT_QUERY.dir,
+    ids: parseVaultIds(source.get("ids")),
+  };
+}
+
+/** Serializes a query to a search string, omitting defaults so the default view has a clean URL. */
+export function serializeVaultQuery(q: VaultQuery): string {
+  const p = new URLSearchParams();
+  if (q.strategy) p.set("strategy", q.strategy);
+  if (q.underlying) p.set("underlying", q.underlying);
+  if (q.status) p.set("status", q.status);
+  if (q.risk) p.set("risk", q.risk);
+  if (q.tenor) p.set("tenor", String(q.tenor));
+  if (q.sort !== DEFAULT_VAULT_QUERY.sort) p.set("sort", q.sort);
+  if (q.dir !== DEFAULT_VAULT_QUERY.dir) p.set("dir", q.dir);
+  if (q.ids.length) p.set("ids", q.ids.join(","));
+  return p.toString();
+}
+
+// ---------------------------------------------------------------------------
+// Shared metric definitions. Use these wherever APY, utilization, fees or
+// drawdown are shown or compared so the numbers mean the same thing everywhere.
+// ---------------------------------------------------------------------------
+
+/** Vault status, with `full` derived from TVL reaching capacity. */
+export function effectiveStatus(v: VaultSummary): VaultStatus {
+  return v.tvl >= v.capacity ? "full" : v.status;
+}
+
+/** Share of capacity used (0–1+). */
+export function capacityUtilization(v: VaultSummary): number {
+  return v.capacity > 0 ? v.tvl / v.capacity : 0;
+}
+
+/** Management plus performance fee, in whole percent. */
+export function totalFeePct(v: VaultSummary): number {
+  return v.feeStructure.managementPct + v.feeStructure.performancePct;
+}
+
+function sortValue(v: VaultSummary, key: VaultSortKey): number | null {
+  switch (key) {
+    case "apy":         return v.apy;
+    case "utilization": return capacityUtilization(v);
+    case "tvl":         return v.tvl;
+    case "drawdown":    return v.maxDrawdownPct;
+    case "fees":        return totalFeePct(v);
+  }
+}
+
+export function filterVaults(vaults: readonly VaultSummary[], q: VaultQuery): VaultSummary[] {
+  return vaults.filter(v =>
+    (!q.strategy || v.strategy === q.strategy) &&
+    (!q.underlying || v.underlying === q.underlying) &&
+    (!q.status || effectiveStatus(v) === q.status) &&
+    (!q.risk || v.riskRating === q.risk) &&
+    (q.tenor === null || v.epochDays === q.tenor)
+  );
+}
+
+/**
+ * Sorts by the query's key and direction. Vaults with no value for the key
+ * (e.g. no drawdown history yet) always sort last, and ties break on id so
+ * the order is deterministic.
+ */
+export function sortVaults(vaults: readonly VaultSummary[], q: VaultQuery): VaultSummary[] {
+  const sign = q.dir === "asc" ? 1 : -1;
+  return [...vaults].sort((a, b) => {
+    const av = sortValue(a, q.sort);
+    const bv = sortValue(b, q.sort);
+    if (av === null && bv === null) return a.id.localeCompare(b.id);
+    if (av === null) return 1;
+    if (bv === null) return -1;
+    return (av - bv) * sign || a.id.localeCompare(b.id);
+  });
+}
+
+/** Percent from a 0–1 fraction. Null renders as an em dash. */
+export function fmtPct(n: number | null, digits = 1): string {
+  return n === null ? "—" : `${(n * 100).toFixed(digits)}%`;
+}
+
+/** Whole-percent fee, e.g. 10 → "10%". */
+export function fmtFeePct(n: number): string {
+  return n === 0 ? "None" : `${n}%`;
+}
+
+export function fmtUsd(n: number) {
+  if (n >= 1_000_000) return `$${(n / 1_000_000).toFixed(2)}M`;
+  if (n >= 1_000) return `$${(n / 1_000).toFixed(1)}K`;
+  return `$${n.toFixed(2)}`;
+}
+
+export function fmtStrike(n: number) {
+  return n >= 1000
+    ? `$${n.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
+    : `$${n.toFixed(4)}`;
 }
 
 /** One historical epoch record. */
@@ -71,7 +271,6 @@ export interface VaultDetail extends VaultSummary {
   phaseEndsAt: string; // ISO — when the current phase ends
   sharePrice: number; // current NAV per share in USD
   totalShares: number;
-  feeStructure: { managementPct: number; performancePct: number };
   payoffExplanation: string;
   historicalEpochs: EpochRecord[];
   userPosition: UserVaultPosition | null;
@@ -95,6 +294,9 @@ const MOCK_VAULTS: VaultDetail[] = [
     currentExpiry: "2026-10-03",
     riskRating: "medium",
     description: "Writes weekly out-of-the-money covered calls on XLM. Collects premium each epoch; the vault holds XLM as collateral.",
+    status: "open",
+    epochDays: 7,
+    maxDrawdownPct: 0.07,
     currentEpoch: 47,
     currentPhase: "active",
     phaseEndsAt: "2026-10-03T16:00:00Z",
@@ -124,6 +326,9 @@ const MOCK_VAULTS: VaultDetail[] = [
     currentExpiry: "2026-10-17",
     riskRating: "high",
     description: "Writes monthly cash-secured puts on BTC. The vault holds USDC as collateral; assignment means acquiring BTC at the strike.",
+    status: "open",
+    epochDays: 30,
+    maxDrawdownPct: 0.21,
     currentEpoch: 18,
     currentPhase: "active",
     phaseEndsAt: "2026-10-17T20:00:00Z",
@@ -151,6 +356,9 @@ const MOCK_VAULTS: VaultDetail[] = [
     currentExpiry: "2026-10-10",
     riskRating: "low",
     description: "Sells 30-day iron condors on ETH, targeting a range-bound market. Limited loss profile; wins when ETH stays between the two breakevens.",
+    status: "open",
+    epochDays: 30,
+    maxDrawdownPct: null,
     currentEpoch: 11,
     currentPhase: "deposit",
     phaseEndsAt: "2026-09-28T12:00:00Z",
@@ -177,6 +385,9 @@ const MOCK_VAULTS: VaultDetail[] = [
     currentExpiry: "2026-10-03",
     riskRating: "high",
     description: "Runs the wheel strategy on SOL: sells cash-secured puts until assigned, then sells covered calls until called away, capturing premium in both directions.",
+    status: "closed_to_deposits",
+    epochDays: 7,
+    maxDrawdownPct: null,
     currentEpoch: 28,
     currentPhase: "settlement",
     phaseEndsAt: "2026-09-28T16:00:00Z",
