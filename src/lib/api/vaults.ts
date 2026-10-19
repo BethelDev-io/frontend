@@ -16,7 +16,12 @@
  *
  *   POST /api/v1/vaults/{id}/deposit   { amount: number }  → { tx_id: string }
  *   POST /api/v1/vaults/{id}/withdraw  { shares: number }  → { tx_id: string; queued: boolean }
+ *
+ *   GET /api/v1/vaults/positions
+ *   → VaultPositionWire[]  (one row per vault the wallet holds; `error` set when that vault failed)
  */
+
+import { bffFetch } from "./client";
 
 export type VaultStrategy = "covered_call" | "cash_secured_put" | "iron_condor" | "wheel";
 export type RiskRating = "low" | "medium" | "high";
@@ -210,6 +215,143 @@ export async function fetchVaultDetail(id: string, _token?: string | null): Prom
     throw new Error("Live vaults API not yet implemented");
   }
   return Promise.resolve(MOCK_VAULTS.find(v => v.id === id) ?? null);
+}
+
+// ---------------------------------------------------------------------------
+// Wallet vault positions (portfolio / account surfaces)
+// ---------------------------------------------------------------------------
+
+/** NAV older than this is flagged as stale instead of being presented as current. */
+export const NAV_STALE_AFTER_MS = 15 * 60 * 1000;
+
+/** Wire shape of one vault position from GET /api/v1/vaults/positions. */
+export interface VaultPositionWire {
+  vault_id: string;
+  name: string;
+  strategy: VaultStrategy;
+  /** Shares held, including any queued for redemption. */
+  shares: number;
+  pending_withdrawal_shares: number;
+  /** USD deposits queued for the next epoch, not yet minted into shares. */
+  pending_deposit_usd: number;
+  nav_per_share: number;
+  /** Total USD paid in for all shares held. */
+  cost_basis_usd: number;
+  nav_as_of: string; // ISO
+  /** Set instead of the position fields when this vault's data failed to load. */
+  error?: string;
+}
+
+/** A wallet's position in one vault, normalised for display and aggregation. */
+export interface VaultPositionRow {
+  vaultId: string;
+  name: string;
+  strategy: VaultStrategy;
+  /** Settled shares only — queued redemptions are excluded. */
+  shares: number;
+  navPerShare: number;
+  /** Settled shares × NAV per share. */
+  currentValue: number;
+  /** Cost basis of the settled shares. */
+  costBasis: number;
+  unrealisedPnl: number;
+  /** Queued redemptions (at NAV) plus queued deposits, shown as pending. */
+  pendingValue: number;
+  navAsOf: string; // ISO
+  navStale: boolean;
+}
+
+export interface VaultPositionFailure {
+  vaultId: string;
+  name: string;
+  message: string;
+}
+
+export interface VaultPositionsResult {
+  rows: VaultPositionRow[];
+  /** Vaults whose data failed to load. They are excluded from every total. */
+  failed: VaultPositionFailure[];
+}
+
+export interface VaultPortfolioTotals {
+  currentValue: number;
+  pendingValue: number;
+  costBasis: number;
+  unrealisedPnl: number;
+  staleCount: number;
+}
+
+function toPositionRow(w: VaultPositionWire, now: number): VaultPositionRow {
+  const settledShares = Math.max(0, w.shares - w.pending_withdrawal_shares);
+  const currentValue = settledShares * w.nav_per_share;
+  const costBasis = w.shares > 0 ? (w.cost_basis_usd * settledShares) / w.shares : 0;
+  return {
+    vaultId: w.vault_id,
+    name: w.name,
+    strategy: w.strategy,
+    shares: settledShares,
+    navPerShare: w.nav_per_share,
+    currentValue,
+    costBasis,
+    unrealisedPnl: currentValue - costBasis,
+    pendingValue: w.pending_withdrawal_shares * w.nav_per_share + w.pending_deposit_usd,
+    navAsOf: w.nav_as_of,
+    navStale: now - Date.parse(w.nav_as_of) > NAV_STALE_AFTER_MS,
+  };
+}
+
+/**
+ * Wallet vault positions. Live reads the BFF (bearer token stays server-side);
+ * otherwise the mock vault data is the only source.
+ */
+export async function fetchVaultPositions(): Promise<VaultPositionsResult> {
+  const now = Date.now();
+  let wire: VaultPositionWire[];
+
+  if (process.env.NEXT_PUBLIC_VAULTS === "live") {
+    const res = await bffFetch("/api/v1/vaults/positions");
+    if (!res.ok) throw new Error(`Vault positions request failed (${res.status})`);
+    wire = (await res.json()) as VaultPositionWire[];
+  } else {
+    wire = MOCK_VAULTS.flatMap(v => {
+      const p = v.userPosition;
+      if (!p) return [];
+      return [{
+        vault_id: v.id,
+        name: v.name,
+        strategy: v.strategy,
+        shares: p.shares,
+        pending_withdrawal_shares: p.pendingWithdrawal,
+        pending_deposit_usd: 0,
+        nav_per_share: v.sharePrice,
+        // Mock cost basis is the principal: total value less accrued premium.
+        cost_basis_usd: p.totalValue - p.accruedPremium,
+        nav_as_of: new Date(now).toISOString(),
+      }];
+    });
+  }
+
+  const rows: VaultPositionRow[] = [];
+  const failed: VaultPositionFailure[] = [];
+  for (const w of wire) {
+    if (w.error) failed.push({ vaultId: w.vault_id, name: w.name, message: w.error });
+    else rows.push(toPositionRow(w, now));
+  }
+  return { rows, failed };
+}
+
+/** Totals across settled rows. Stale rows are counted but flagged via `staleCount`. */
+export function aggregateVaultPositions(rows: VaultPositionRow[]): VaultPortfolioTotals {
+  return rows.reduce<VaultPortfolioTotals>(
+    (t, r) => ({
+      currentValue: t.currentValue + r.currentValue,
+      pendingValue: t.pendingValue + r.pendingValue,
+      costBasis: t.costBasis + r.costBasis,
+      unrealisedPnl: t.unrealisedPnl + r.unrealisedPnl,
+      staleCount: t.staleCount + (r.navStale ? 1 : 0),
+    }),
+    { currentValue: 0, pendingValue: 0, costBasis: 0, unrealisedPnl: 0, staleCount: 0 },
+  );
 }
 
 export async function depositToVault(
