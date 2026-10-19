@@ -238,3 +238,135 @@ export async function withdrawFromVault(
   await new Promise(r => setTimeout(r, 600));
   return { tx_id: `mock-tx-withdraw-${id}-${shares.toFixed(0)}-${Date.now()}`, queued: true };
 }
+
+// ---------------------------------------------------------------------------
+// Cross-strategy allocator policy (pure)
+// See docs/vault-allocator.md for the rebalancing policy semantics.
+// ---------------------------------------------------------------------------
+
+/** One child vault the allocator holds shares of. */
+export interface AllocatorChild {
+  vaultId: string;
+  /** Target weight of allocator NAV, 0–1. */
+  targetWeight: number;
+  /** Absolute weight drift (0–1) tolerated before a rebalance is triggered. */
+  driftBand: number;
+}
+
+/** Governed, versioned target-weight configuration for an allocator. */
+export interface AllocatorPolicy {
+  /** Bumped on every governed change so past rebalances stay auditable. */
+  version: number;
+  children: AllocatorChild[];
+}
+
+/** Marked state of one child holding, as seen by the allocator. */
+export interface AllocatorHolding {
+  vaultId: string;
+  /** USD value of shares held, marked at the child's last published epoch NAV. */
+  value: number;
+  /** False when the child has not published NAV for its current epoch. */
+  navPublished: boolean;
+  paused: boolean;
+}
+
+export interface AllocatorDrift {
+  vaultId: string;
+  currentWeight: number;
+  drift: number;
+  breached: boolean;
+  /** Child can be traded now (NAV published for current epoch and not paused). */
+  tradeable: boolean;
+}
+
+export interface AllocatorNav {
+  /** Sum of marked holding values, USD. */
+  nav: number;
+  /** True when any holding is priced from a stale mark or cannot be traded. */
+  degraded: boolean;
+  untradeableVaultIds: string[];
+}
+
+const WEIGHT_SUM_TOLERANCE = 1e-9;
+
+/**
+ * Returns human-readable policy errors. An empty array means the policy is valid.
+ * `allocatorIds` must include every allocator vault, including the allocator being configured,
+ * so that holding itself or another allocator is rejected.
+ */
+export function validateAllocatorPolicy(
+  allocatorId: string,
+  policy: AllocatorPolicy,
+  allocatorIds: ReadonlySet<string>
+): string[] {
+  const errors: string[] = [];
+  if (policy.children.length === 0) errors.push("Policy must contain at least one child vault");
+
+  const seen = new Set<string>();
+  let weightSum = 0;
+  for (const child of policy.children) {
+    if (seen.has(child.vaultId)) errors.push(`Duplicate child vault: ${child.vaultId}`);
+    seen.add(child.vaultId);
+
+    if (child.vaultId === allocatorId || allocatorIds.has(child.vaultId)) {
+      errors.push(`Allocator cannot hold shares of an allocator: ${child.vaultId}`);
+    }
+    if (!(child.targetWeight >= 0 && child.targetWeight <= 1)) {
+      errors.push(`Target weight out of range for ${child.vaultId}`);
+    }
+    if (!(child.driftBand > 0 && child.driftBand <= 1)) {
+      errors.push(`Drift band out of range for ${child.vaultId}`);
+    }
+    weightSum += child.targetWeight;
+  }
+
+  if (Math.abs(weightSum - 1) > WEIGHT_SUM_TOLERANCE) {
+    errors.push(`Target weights must sum to 1, got ${weightSum}`);
+  }
+  return errors;
+}
+
+/** Marks a holding as tradeable only when its NAV is published for the current epoch and it is not paused. */
+export function isHoldingTradeable(holding: AllocatorHolding): boolean {
+  return holding.navPublished && !holding.paused;
+}
+
+/** Computes current weights and drift per child against the policy targets. */
+export function computeAllocatorDrift(
+  policy: AllocatorPolicy,
+  holdings: AllocatorHolding[]
+): AllocatorDrift[] {
+  const totalValue = holdings.reduce((sum, h) => sum + h.value, 0);
+  const byId = new Map(holdings.map(h => [h.vaultId, h]));
+
+  return policy.children.map(child => {
+    const holding = byId.get(child.vaultId);
+    const currentWeight = holding && totalValue > 0 ? holding.value / totalValue : 0;
+    const drift = currentWeight - child.targetWeight;
+    return {
+      vaultId: child.vaultId,
+      currentWeight,
+      drift,
+      breached: Math.abs(drift) > child.driftBand,
+      tradeable: holding ? isHoldingTradeable(holding) : false,
+    };
+  });
+}
+
+/**
+ * Rebalance is due when any child breaches its drift band. A breach on an untradeable
+ * child does not make the rebalance executable; the caller must rebalance the tradeable children only.
+ */
+export function isRebalanceDue(drifts: AllocatorDrift[]): boolean {
+  return drifts.some(d => d.breached && d.tradeable);
+}
+
+/** Allocator NAV from marked child holdings. Untradeable or stale holdings flag the NAV as degraded. */
+export function computeAllocatorNav(holdings: AllocatorHolding[]): AllocatorNav {
+  const untradeableVaultIds = holdings.filter(h => !isHoldingTradeable(h)).map(h => h.vaultId);
+  return {
+    nav: holdings.reduce((sum, h) => sum + h.value, 0),
+    degraded: untradeableVaultIds.length > 0,
+    untradeableVaultIds,
+  };
+}
