@@ -14,8 +14,16 @@
  *   GET /api/v1/vaults/{id}
  *   → VaultDetail
  *
- *   POST /api/v1/vaults/{id}/deposit   { amount: number }  → { tx_id: string }
+ *   POST /api/v1/vaults/{id}/deposit   { amount: number; disclosure_version: string }  → { tx_id: string }
  *   POST /api/v1/vaults/{id}/withdraw  { shares: number }  → { tx_id: string; queued: boolean }
+ *
+ *   POST /api/v1/vaults/disclosures/acknowledge
+ *     { disclosure_version, text_hash, jurisdiction_attested }  → DisclosureAcknowledgement
+ *   GET  /api/v1/vaults/disclosures/me  → DisclosureAcknowledgement[]
+ *
+ * Deposits are rejected server-side (403 with a PolicyReasonCode) unless the
+ * wallet holds an acknowledgement for the current disclosure version. The
+ * client check in the UI is advisory only.
  */
 
 export type VaultStrategy = "covered_call" | "cash_secured_put" | "iron_condor" | "wheel";
@@ -193,6 +201,127 @@ const MOCK_VAULTS: VaultDetail[] = [
 ];
 
 // ---------------------------------------------------------------------------
+// Depositor disclosure & eligibility
+// ---------------------------------------------------------------------------
+
+/**
+ * Current risk-disclosure version. Bump this whenever the copy under
+ * `vaultDisclosure.p1`–`p5` in messages/en.json changes, so every wallet
+ * re-acknowledges. Acknowledgements for older versions stay in the audit
+ * trail unchanged.
+ */
+export const VAULT_DISCLOSURE_VERSION = "2026-10-19.1";
+
+export type PolicyReasonCode =
+  | "DISCLOSURE_NOT_ACCEPTED"
+  | "DISCLOSURE_VERSION_STALE"
+  | "JURISDICTION_NOT_ELIGIBLE";
+
+/** Policy rejection. `code` is stable and is what the UI maps to copy. */
+export class VaultPolicyError extends Error {
+  code: PolicyReasonCode;
+
+  constructor(code: PolicyReasonCode) {
+    super(code);
+    this.name = "VaultPolicyError";
+    this.code = code;
+  }
+}
+
+/**
+ * One row in the acknowledgement audit trail. Deliberately holds no personal
+ * data beyond the wallet address and the self-declared jurisdiction attestation.
+ */
+export interface DisclosureAcknowledgement {
+  wallet: string;
+  disclosureVersion: string;
+  /** SHA-256 (hex) of the disclosure text as rendered to the user. */
+  textHash: string;
+  jurisdictionAttested: boolean;
+  acceptedAt: string; // ISO
+}
+
+export interface AcknowledgeDisclosureInput {
+  wallet: string;
+  disclosureVersion: string;
+  textHash: string;
+  jurisdictionAttested: boolean;
+}
+
+/** SHA-256 hex digest of the disclosure text, used to fingerprint what was accepted. */
+export async function hashDisclosureText(text: string): Promise<string> {
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(text));
+  return Array.from(new Uint8Array(digest), b => b.toString(16).padStart(2, "0")).join("");
+}
+
+// Mock persistence standing in for the backend's append-only acknowledgement table.
+const MOCK_ACK_STORAGE_KEY = "zenith.vaults.disclosureAcks.v1";
+
+function readMockAcks(): DisclosureAcknowledgement[] {
+  if (typeof window === "undefined") return [];
+  try {
+    return JSON.parse(window.localStorage.getItem(MOCK_ACK_STORAGE_KEY) ?? "[]");
+  } catch {
+    return [];
+  }
+}
+
+function appendMockAck(ack: DisclosureAcknowledgement): void {
+  if (typeof window === "undefined") return;
+  window.localStorage.setItem(MOCK_ACK_STORAGE_KEY, JSON.stringify([...readMockAcks(), ack]));
+}
+
+/** Server-side rule: the wallet's latest acknowledgement must match the current version. */
+function assertDisclosureAccepted(wallet: string, disclosureVersion: string): void {
+  if (disclosureVersion !== VAULT_DISCLOSURE_VERSION) {
+    throw new VaultPolicyError("DISCLOSURE_VERSION_STALE");
+  }
+  const latest = readMockAcks().filter(a => a.wallet === wallet).at(-1);
+  if (!latest) throw new VaultPolicyError("DISCLOSURE_NOT_ACCEPTED");
+  if (latest.disclosureVersion !== VAULT_DISCLOSURE_VERSION) {
+    throw new VaultPolicyError("DISCLOSURE_VERSION_STALE");
+  }
+  if (!latest.jurisdictionAttested) throw new VaultPolicyError("JURISDICTION_NOT_ELIGIBLE");
+}
+
+/** Records the wallet's acceptance of the current disclosure version. */
+export async function acknowledgeDisclosure(
+  input: AcknowledgeDisclosureInput,
+  _token: string
+): Promise<DisclosureAcknowledgement> {
+  if (process.env.NEXT_PUBLIC_VAULTS === "live") {
+    // TODO: return apiPost<DisclosureAcknowledgement>("/api/v1/vaults/disclosures/acknowledge", {...}, token);
+    throw new Error("Live vaults API not yet implemented");
+  }
+  if (input.disclosureVersion !== VAULT_DISCLOSURE_VERSION) {
+    throw new VaultPolicyError("DISCLOSURE_VERSION_STALE");
+  }
+  if (!input.jurisdictionAttested) throw new VaultPolicyError("JURISDICTION_NOT_ELIGIBLE");
+  await new Promise(r => setTimeout(r, 300));
+  const ack: DisclosureAcknowledgement = {
+    wallet: input.wallet,
+    disclosureVersion: input.disclosureVersion,
+    textHash: input.textHash,
+    jurisdictionAttested: input.jurisdictionAttested,
+    acceptedAt: new Date().toISOString(),
+  };
+  appendMockAck(ack);
+  return ack;
+}
+
+/** Returns every acknowledgement recorded for the given wallet, oldest first. */
+export async function fetchMyDisclosureAcknowledgements(
+  wallet: string,
+  _token: string
+): Promise<DisclosureAcknowledgement[]> {
+  if (process.env.NEXT_PUBLIC_VAULTS === "live") {
+    // TODO: return apiGet<DisclosureAcknowledgement[]>("/api/v1/vaults/disclosures/me", token);
+    throw new Error("Live vaults API not yet implemented");
+  }
+  return Promise.resolve(readMockAcks().filter(a => a.wallet === wallet));
+}
+
+// ---------------------------------------------------------------------------
 // Public adapter
 // ---------------------------------------------------------------------------
 
@@ -215,12 +344,15 @@ export async function fetchVaultDetail(id: string, _token?: string | null): Prom
 export async function depositToVault(
   id: string,
   amount: number,
-  _token: string
+  _token: string,
+  disclosure: { wallet: string; disclosureVersion: string }
 ): Promise<{ tx_id: string }> {
   if (process.env.NEXT_PUBLIC_VAULTS === "live") {
-    // TODO: return apiPost<{tx_id:string}>(`/api/v1/vaults/${id}/deposit`, { amount }, token);
+    // TODO: return apiPost<{tx_id:string}>(`/api/v1/vaults/${id}/deposit`, { amount, disclosure_version }, token);
     throw new Error("Live vaults API not yet implemented");
   }
+  // Mock server-side gate: the live backend derives the wallet from the bearer token.
+  assertDisclosureAccepted(disclosure.wallet, disclosure.disclosureVersion);
   // Mock: simulate a 600ms network round-trip
   await new Promise(r => setTimeout(r, 600));
   return { tx_id: `mock-tx-deposit-${id}-${amount.toFixed(0)}-${Date.now()}` };
