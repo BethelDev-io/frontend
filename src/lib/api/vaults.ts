@@ -238,3 +238,166 @@ export async function withdrawFromVault(
   await new Promise(r => setTimeout(r, 600));
   return { tx_id: `mock-tx-withdraw-${id}-${shares.toFixed(0)}-${Date.now()}`, queued: true };
 }
+
+// ---------------------------------------------------------------------------
+// Event notifications
+// ---------------------------------------------------------------------------
+
+export type VaultEventType =
+  | "epoch_opened"
+  | "epoch_closed"
+  | "nav_published"
+  | "premium_collected"
+  | "assignment"
+  | "redemption_claimable"
+  | "redemption_expired"
+  | "vault_paused"
+  | "vault_unpaused"
+  | "capacity_reached"
+  | "nav_drift";
+export type VaultNotificationSeverity = "info" | "warning" | "critical";
+export type VaultNotificationChannel = "in_app" | "email" | "webhook";
+
+/** A vault event from the indexer. `eventId` is the on-chain identity used for dedupe. */
+export interface VaultEvent {
+  eventId: string;
+  type: VaultEventType;
+  vaultId: string;
+  epoch: number;
+  occurredAt: string; // ISO
+  /** Optional numeric payload, e.g. the published NAV for `nav_published`. */
+  value?: number;
+}
+
+export interface VaultEventRoute {
+  severity: VaultNotificationSeverity;
+  channels: VaultNotificationChannel[];
+  /** Events older than this are dropped so historical backfills don't flood the feed. */
+  staleAfterMs: number;
+  /** Epoch-cadence events are not sent while the vault is paused. */
+  suppressWhenPaused: boolean;
+  /** Security-relevant events ignore quiet hours so they meet their severity SLA. */
+  bypassQuietHours: boolean;
+  /** Only depositors with a non-zero balance receive the event. */
+  requiresBalance: boolean;
+}
+
+const MINUTE_MS = 60 * 1000;
+const HOUR_MS = 60 * MINUTE_MS;
+const DAY_MS = 24 * HOUR_MS;
+
+const ALL_CHANNELS: VaultNotificationChannel[] = ["in_app", "email", "webhook"];
+
+/** Routing table: default severity, channels, and delivery guards per event type. */
+export const VAULT_EVENT_ROUTING: Record<VaultEventType, VaultEventRoute> = {
+  epoch_opened: { severity: "info", channels: ALL_CHANNELS, staleAfterMs: 6 * HOUR_MS, suppressWhenPaused: true, bypassQuietHours: false, requiresBalance: false },
+  epoch_closed: { severity: "info", channels: ALL_CHANNELS, staleAfterMs: 6 * HOUR_MS, suppressWhenPaused: true, bypassQuietHours: false, requiresBalance: true },
+  nav_published: { severity: "info", channels: ["in_app", "webhook"], staleAfterMs: 6 * HOUR_MS, suppressWhenPaused: false, bypassQuietHours: false, requiresBalance: true },
+  premium_collected: { severity: "info", channels: ["in_app"], staleAfterMs: DAY_MS, suppressWhenPaused: false, bypassQuietHours: false, requiresBalance: true },
+  assignment: { severity: "warning", channels: ALL_CHANNELS, staleAfterMs: DAY_MS, suppressWhenPaused: false, bypassQuietHours: false, requiresBalance: true },
+  redemption_claimable: { severity: "warning", channels: ALL_CHANNELS, staleAfterMs: 2 * DAY_MS, suppressWhenPaused: false, bypassQuietHours: false, requiresBalance: true },
+  redemption_expired: { severity: "warning", channels: ALL_CHANNELS, staleAfterMs: 2 * DAY_MS, suppressWhenPaused: false, bypassQuietHours: false, requiresBalance: true },
+  vault_paused: { severity: "critical", channels: ALL_CHANNELS, staleAfterMs: DAY_MS, suppressWhenPaused: false, bypassQuietHours: true, requiresBalance: false },
+  vault_unpaused: { severity: "warning", channels: ALL_CHANNELS, staleAfterMs: DAY_MS, suppressWhenPaused: false, bypassQuietHours: true, requiresBalance: false },
+  capacity_reached: { severity: "info", channels: ["in_app", "email"], staleAfterMs: DAY_MS, suppressWhenPaused: false, bypassQuietHours: false, requiresBalance: false },
+  nav_drift: { severity: "critical", channels: ALL_CHANNELS, staleAfterMs: 6 * HOUR_MS, suppressWhenPaused: false, bypassQuietHours: true, requiresBalance: true },
+};
+
+/** Versioned copy catalog key for an event type. Copy lives in `messages/*.json`. */
+export function vaultNotificationCopyKey(type: VaultEventType): string {
+  return `vaults.notifications.v1.${type}`;
+}
+
+export interface VaultNotificationPreferences {
+  /** Per-event-type channel opt-ins. Missing types fall back to the routing table defaults. */
+  events: Partial<Record<VaultEventType, VaultNotificationChannel[]>>;
+  /** Global unsubscribe. Routing is evaluated at delivery time, so this takes effect immediately. */
+  unsubscribed: boolean;
+  /** Quiet hours in UTC. Non-bypass events are deferred, not dropped, while quiet. */
+  quietHours?: { startHourUtc: number; endHourUtc: number };
+}
+
+export interface VaultEventContext {
+  now: Date;
+  vaultPaused: boolean;
+  depositorBalance: number;
+  /** True when the depositor's email is on the hard-bounce suppression list. */
+  emailSuppressed?: boolean;
+}
+
+export interface VaultEventRouting {
+  /** Channels to deliver to now. */
+  deliver: VaultNotificationChannel[];
+  /** Channels to deliver once quiet hours end. */
+  deferred: VaultNotificationChannel[];
+}
+
+function inQuietHours(now: Date, quietHours?: VaultNotificationPreferences["quietHours"]): boolean {
+  if (!quietHours) return false;
+  const hour = now.getUTCHours();
+  const { startHourUtc: start, endHourUtc: end } = quietHours;
+  return start <= end ? hour >= start && hour < end : hour >= start || hour < end;
+}
+
+/** Decides which channels a depositor receives a single event on. Pure: no I/O. */
+export function routeVaultEvent(
+  event: VaultEvent,
+  prefs: VaultNotificationPreferences,
+  ctx: VaultEventContext
+): VaultEventRouting {
+  const route = VAULT_EVENT_ROUTING[event.type];
+  const none: VaultEventRouting = { deliver: [], deferred: [] };
+
+  if (prefs.unsubscribed) return none;
+  if (ctx.now.getTime() - Date.parse(event.occurredAt) > route.staleAfterMs) return none;
+  if (route.suppressWhenPaused && ctx.vaultPaused) return none;
+  if (route.requiresBalance && ctx.depositorBalance <= 0) return none;
+
+  const optedIn = prefs.events[event.type] ?? route.channels;
+  const channels = route.channels.filter(c => optedIn.includes(c) && !(c === "email" && ctx.emailSuppressed));
+
+  if (!route.bypassQuietHours && inQuietHours(ctx.now, prefs.quietHours)) {
+    return { deliver: channels.filter(c => c === "in_app"), deferred: channels.filter(c => c !== "in_app") };
+  }
+  return { deliver: channels, deferred: [] };
+}
+
+/** Notification identity: one row per (event, depositor, channel), so replays are idempotent. */
+export function vaultNotificationKey(eventId: string, depositor: string, channel: VaultNotificationChannel): string {
+  return `${eventId}:${depositor}:${channel}`;
+}
+
+/** Keeps the first occurrence of each on-chain event. */
+export function dedupeVaultEvents(events: VaultEvent[]): VaultEvent[] {
+  const seen = new Set<string>();
+  return events.filter(e => {
+    if (seen.has(e.eventId)) return false;
+    seen.add(e.eventId);
+    return true;
+  });
+}
+
+/** Orders events per vault by epoch, then occurrence time, so a vault's feed never runs backwards. */
+export function orderVaultEvents(events: VaultEvent[]): VaultEvent[] {
+  return [...events].sort(
+    (a, b) =>
+      a.vaultId.localeCompare(b.vaultId) ||
+      a.epoch - b.epoch ||
+      Date.parse(a.occurredAt) - Date.parse(b.occurredAt) ||
+      a.eventId.localeCompare(b.eventId)
+  );
+}
+
+/** Mock in-app feed: deduped and ordered, the same shape the live BFF route should return. */
+export async function fetchVaultEventFeed(_token?: string | null): Promise<VaultEvent[]> {
+  if (process.env.NEXT_PUBLIC_VAULTS === "live") {
+    // TODO: return apiGet<VaultEvent[]>("/api/v1/vaults/events", token);
+    throw new Error("Live vaults API not yet implemented");
+  }
+  const ago = (ms: number) => new Date(Date.now() - ms).toISOString();
+  const mock: VaultEvent[] = [
+    { eventId: "mock-evt-2", type: "epoch_closed", vaultId: "xlm-cc-v1", epoch: 47, occurredAt: ago(30 * MINUTE_MS) },
+    { eventId: "mock-evt-1", type: "epoch_opened", vaultId: "xlm-cc-v1", epoch: 48, occurredAt: ago(10 * MINUTE_MS) },
+  ];
+  return Promise.resolve(orderVaultEvents(dedupeVaultEvents(mock)));
+}
