@@ -238,3 +238,226 @@ export async function withdrawFromVault(
   await new Promise(r => setTimeout(r, 600));
   return { tx_id: `mock-tx-withdraw-${id}-${shares.toFixed(0)}-${Date.now()}`, queued: true };
 }
+
+// ---------------------------------------------------------------------------
+// Operator console
+//
+// Internal-only surface for vault operators. Every call goes through the BFF
+// (/api/bff/...), which attaches the session token server-side. Operator
+// authorization is enforced by the backend: a non-operator gets 403 and no
+// state changes. Parameter changes never write directly; they return a
+// governance proposal id.
+// ---------------------------------------------------------------------------
+
+/** Above this indexer lag, state is stale and unsafe actions are disabled. */
+export const INDEXER_LAG_LIMIT_SECONDS = 60;
+
+export interface StuckQueueAlert {
+  id: string;
+  epoch: number;
+  openedAt: string; // ISO
+  unfulfilledTickets: number;
+}
+
+export interface VaultOperatorStatus {
+  vaultId: string;
+  currentEpoch: number;
+  epochState: EpochPhase;
+  lastRolloverAt: string; // ISO
+  pendingRedemptions: number; // unfulfilled redemption tickets
+  capacityUtilisation: number; // 0–1
+  indexerUpdatedAt: string; // ISO — when the indexer last caught up
+  paused: boolean;
+  stuckQueueAlerts: StuckQueueAlert[];
+}
+
+export type OperatorAction =
+  | "rollover"
+  | "pause"
+  | "resume"
+  | "resolve_alert"
+  | "parameter_change";
+
+export interface OperatorAuditEntry {
+  id: string;
+  actor: string;
+  vaultId: string;
+  action: OperatorAction;
+  before: string;
+  after: string;
+  timestamp: string; // ISO
+}
+
+export type VaultParameterKey = "managementPct" | "performancePct" | "capacity";
+
+export interface ParameterChangeRequest {
+  key: VaultParameterKey;
+  value: number;
+}
+
+export interface ParameterChangeResult {
+  proposal_id: string;
+}
+
+/** Thrown with `status` so the UI can handle 409 (stale epoch) distinctly. */
+export class OperatorApiError extends Error {
+  constructor(message: string, public readonly status: number) {
+    super(message);
+    this.name = "OperatorApiError";
+  }
+}
+
+function csrfToken(): string {
+  const m = document.cookie.match(/(?:^|; )(?:__Host-)?zenith_csrf=([^;]*)/);
+  return m ? decodeURIComponent(m[1]) : "";
+}
+
+async function operatorRequest<T>(method: "GET" | "POST", path: string, body?: unknown): Promise<T> {
+  const res = await fetch(`/api/bff${path}`, {
+    method,
+    credentials: "same-origin",
+    headers: {
+      ...(body !== undefined ? { "content-type": "application/json" } : {}),
+      ...(method !== "GET" ? { "x-zenith-csrf": csrfToken() } : {}),
+    },
+    body: body !== undefined ? JSON.stringify(body) : undefined,
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => null);
+    throw new OperatorApiError(
+      typeof err?.error === "string" ? err.error : `Request failed (${res.status})`,
+      res.status,
+    );
+  }
+  return res.json() as Promise<T>;
+}
+
+const MOCK_OPERATOR_DELAY_MS = 400;
+const mockDelay = () => new Promise(r => setTimeout(r, MOCK_OPERATOR_DELAY_MS));
+
+const mockOperatorStatus = new Map<string, VaultOperatorStatus>(
+  MOCK_VAULTS.map(v => [v.id, {
+    vaultId: v.id,
+    currentEpoch: v.currentEpoch,
+    epochState: v.currentPhase,
+    lastRolloverAt: v.historicalEpochs[0]?.activeStart ?? v.phaseEndsAt,
+    pendingRedemptions: v.id === "sol-wheel-v1" ? 3 : 0,
+    capacityUtilisation: v.tvl / v.capacity,
+    indexerUpdatedAt: new Date(Date.now() - 12_000).toISOString(),
+    paused: false,
+    stuckQueueAlerts: v.id === "sol-wheel-v1"
+      ? [{ id: "alert-sol-1", epoch: v.currentEpoch, openedAt: v.phaseEndsAt, unfulfilledTickets: 3 }]
+      : [],
+  }]),
+);
+const mockAuditLog: OperatorAuditEntry[] = [];
+
+function mockAudit(entry: Omit<OperatorAuditEntry, "id" | "actor" | "timestamp">) {
+  mockAuditLog.unshift({
+    id: `mock-audit-${mockAuditLog.length + 1}`,
+    actor: "mock-operator",
+    timestamp: new Date().toISOString(),
+    ...entry,
+  });
+}
+
+function mockStatusFor(id: string): VaultOperatorStatus {
+  const status = mockOperatorStatus.get(id);
+  if (!status) throw new OperatorApiError("Vault not found", 404);
+  return status;
+}
+
+/** Operator dashboard state for one vault. */
+export async function fetchOperatorStatus(id: string): Promise<VaultOperatorStatus> {
+  if (process.env.NEXT_PUBLIC_VAULTS === "live") {
+    return operatorRequest<VaultOperatorStatus>("GET", `/api/v1/operator/vaults/${id}/status`);
+  }
+  await mockDelay();
+  return { ...mockStatusFor(id) };
+}
+
+/**
+ * Trigger (or retry) epoch rollover. `expectedEpoch` is the epoch the operator
+ * saw; the backend rejects with 409 if the vault has already moved on.
+ */
+export async function triggerRollover(id: string, expectedEpoch: number): Promise<VaultOperatorStatus> {
+  if (process.env.NEXT_PUBLIC_VAULTS === "live") {
+    return operatorRequest<VaultOperatorStatus>("POST", `/api/v1/operator/vaults/${id}/rollover`, { expected_epoch: expectedEpoch });
+  }
+  await mockDelay();
+  const status = mockStatusFor(id);
+  if (status.currentEpoch !== expectedEpoch) {
+    throw new OperatorApiError(`Stale epoch: vault is on epoch ${status.currentEpoch}`, 409);
+  }
+  const next: VaultOperatorStatus = {
+    ...status,
+    currentEpoch: status.currentEpoch + 1,
+    epochState: "deposit",
+    lastRolloverAt: new Date().toISOString(),
+  };
+  mockOperatorStatus.set(id, next);
+  mockAudit({ vaultId: id, action: "rollover", before: `epoch ${expectedEpoch}`, after: `epoch ${next.currentEpoch}` });
+  return { ...next };
+}
+
+export async function pauseVault(id: string): Promise<VaultOperatorStatus> {
+  if (process.env.NEXT_PUBLIC_VAULTS === "live") {
+    return operatorRequest<VaultOperatorStatus>("POST", `/api/v1/operator/vaults/${id}/pause`);
+  }
+  await mockDelay();
+  const next = { ...mockStatusFor(id), paused: true };
+  mockOperatorStatus.set(id, next);
+  mockAudit({ vaultId: id, action: "pause", before: "unpaused", after: "paused" });
+  return { ...next };
+}
+
+export async function resumeVault(id: string): Promise<VaultOperatorStatus> {
+  if (process.env.NEXT_PUBLIC_VAULTS === "live") {
+    return operatorRequest<VaultOperatorStatus>("POST", `/api/v1/operator/vaults/${id}/resume`);
+  }
+  await mockDelay();
+  const next = { ...mockStatusFor(id), paused: false };
+  mockOperatorStatus.set(id, next);
+  mockAudit({ vaultId: id, action: "resume", before: "paused", after: "unpaused" });
+  return { ...next };
+}
+
+/** Acknowledge and resolve a stuck-queue alert. */
+export async function resolveStuckAlert(vaultId: string, alertId: string): Promise<VaultOperatorStatus> {
+  if (process.env.NEXT_PUBLIC_VAULTS === "live") {
+    return operatorRequest<VaultOperatorStatus>("POST", `/api/v1/operator/vaults/${vaultId}/alerts/${alertId}/resolve`);
+  }
+  await mockDelay();
+  const status = mockStatusFor(vaultId);
+  if (!status.stuckQueueAlerts.some(a => a.id === alertId)) {
+    throw new OperatorApiError("Alert not found", 404);
+  }
+  const next = { ...status, stuckQueueAlerts: status.stuckQueueAlerts.filter(a => a.id !== alertId) };
+  mockOperatorStatus.set(vaultId, next);
+  mockAudit({ vaultId, action: "resolve_alert", before: `alert ${alertId} open`, after: `alert ${alertId} resolved` });
+  return { ...next };
+}
+
+/**
+ * Submit a parameter change. This only opens a governance proposal; the
+ * vault's parameters change when the proposal passes the approval path.
+ */
+export async function submitParameterChange(id: string, change: ParameterChangeRequest, before: number): Promise<ParameterChangeResult> {
+  if (process.env.NEXT_PUBLIC_VAULTS === "live") {
+    return operatorRequest<ParameterChangeResult>("POST", `/api/v1/operator/vaults/${id}/parameter-changes`, change);
+  }
+  await mockDelay();
+  mockStatusFor(id);
+  mockAudit({ vaultId: id, action: "parameter_change", before: `${change.key} ${before}`, after: `${change.key} ${change.value} (pending approval)` });
+  return { proposal_id: `mock-proposal-${id}-${Date.now()}` };
+}
+
+/** Audit log of operator actions, newest first. Optionally filtered to one vault. */
+export async function fetchOperatorAuditLog(vaultId?: string): Promise<OperatorAuditEntry[]> {
+  if (process.env.NEXT_PUBLIC_VAULTS === "live") {
+    const q = vaultId ? `?vault_id=${encodeURIComponent(vaultId)}` : "";
+    return operatorRequest<OperatorAuditEntry[]>("GET", `/api/v1/operator/audit-log${q}`);
+  }
+  await mockDelay();
+  return mockAuditLog.filter(e => !vaultId || e.vaultId === vaultId).map(e => ({ ...e }));
+}
