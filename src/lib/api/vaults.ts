@@ -30,11 +30,34 @@
  *   (`inflationDefense`) and are changeable only through the timelocked
  *   operator path. The adapter surfaces them so the UI can enforce the
  *   same `minSharesOut` bound the contract enforces on deposit.
+ *
+ * Shadow mode (issue #292):
+ *
+ *   A strategy may run in `shadow` mode — the identical strategy module
+ *   and keeper path execute against live oracle/engine data, but no
+ *   option orders are submitted and no depositor collateral is
+ *   committed. Shadow state lives in its own namespace (`shadow` on the
+ *   detail payload) with its own hypothetical NAV-per-share series and
+ *   epoch record stream. It is NEVER merged into `bookValue`,
+ *   `sharePrice`, `tvl`, or `historicalEpochs`, and shadow runs are
+ *   labeled `mode: "shadow"` everywhere they surface so paper results
+ *   cannot be mistaken for realized performance.
  */
 
 export type VaultStrategy = "covered_call" | "cash_secured_put" | "iron_condor" | "wheel";
 export type RiskRating = "low" | "medium" | "high";
 export type EpochPhase = "deposit" | "active" | "settlement";
+
+/**
+ * Execution mode of a vault strategy.
+ *
+ * - `live`: real capital is committed and real option orders are submitted.
+ * - `shadow`: paper trading — the same decision path runs, but no orders
+ *   are submitted and no depositor collateral is committed. Shadow state
+ *   is tracked in a separate namespace and must never be conflated with
+ *   live balances.
+ */
+export type VaultMode = "live" | "shadow";
 
 /**
  * How a direct token transfer to the vault contract address is treated.
@@ -72,6 +95,8 @@ export interface VaultSummary {
   name: string;
   underlying: string;
   strategy: VaultStrategy;
+  /** Execution mode; `shadow` results are paper trading, not realized. */
+  mode: VaultMode;
   /** Trailing 12-month APY estimate (0–1, e.g. 0.18 = 18%). */
   apy: number;
   /** APY methodology note shown in tooltip. */
@@ -108,6 +133,72 @@ export interface UserVaultPosition {
   pendingWithdrawal: number; // shares queued for withdrawal at epoch end
 }
 
+/**
+ * One point in a hypothetical NAV-per-share series produced by a shadow
+ * run. Kept in its own namespace so it can never be read as live NAV.
+ */
+export interface ShadowNavPoint {
+  epochNumber: number;
+  /** Hypothetical NAV per share in USD (paper trading only). */
+  navPerShare: number;
+  /** NAV per share the strategy model expected for this epoch. */
+  expectedNavPerShare: number;
+  /** ISO timestamp the shadow epoch settled. */
+  recordedAt: string;
+}
+
+/**
+ * Side-by-side comparison of a shadow run against live and expected
+ * performance. All shadow figures are paper trading and must be labeled
+ * as such in the UI.
+ */
+export interface ShadowComparison {
+  /** Latest hypothetical NAV per share from the shadow run. */
+  shadowNavPerShare: number;
+  /** Latest realized NAV per share of the live vault (null if none). */
+  liveNavPerShare: number | null;
+  /** NAV per share the strategy model expected for the latest epoch. */
+  expectedNavPerShare: number;
+  /** Shadow minus live NAV per share (null when no live history). */
+  shadowVsLiveDelta: number | null;
+  /** Shadow minus expected NAV per share. */
+  shadowVsExpectedDelta: number;
+  /** Number of complete shadow epochs recorded so far. */
+  completedEpochs: number;
+}
+
+/**
+ * Shadow (paper-trading) state for a vault strategy. Tracked in its own
+ * namespace, with its own hypothetical NAV series and epoch stream, so
+ * the registry, indexer, and this read model never conflate it with real
+ * balances.
+ */
+export interface ShadowState {
+  /** Always `shadow` — makes the paper-trading label explicit in payloads. */
+  mode: "shadow";
+  /** Hypothetical NAV-per-share series, one point per complete epoch. */
+  navSeries: ShadowNavPoint[];
+  /** Shadow epoch record stream (never merged into `historicalEpochs`). */
+  epochs: EpochRecord[];
+  /** Side-by-side comparison data for the operator console/analytics. */
+  comparison: ShadowComparison;
+}
+
+/**
+ * Promotion criteria that must be met before a shadow strategy can be
+ * moved to live allocation. Evaluated by the backend promotion gate; the
+ * adapter surfaces the thresholds so the operator console can display
+ * progress and block promotion when unmet.
+ */
+export interface PromotionCriteria {
+  /** Minimum number of complete shadow epochs required. */
+  minCompleteEpochs: number;
+  /** Max allowed |shadow − expected| NAV deviation per share (USD). */
+  maxNavDeviation: number;
+  /** Whether any invariant violations were recorded during the run. */
+  invariantViolations: number;
+}
+
 /** Full detail for a single vault. */
 export interface VaultDetail extends VaultSummary {
   currentEpoch: number;
@@ -123,6 +214,13 @@ export interface VaultDetail extends VaultSummary {
   payoffExplanation: string;
   historicalEpochs: EpochRecord[];
   userPosition: UserVaultPosition | null;
+  /**
+   * Shadow (paper-trading) state. Present only when `mode === "shadow"`.
+   * Never merged into live fields above.
+   */
+  shadow?: ShadowState;
+  /** Promotion gate thresholds; present for shadow runs. */
+  promotionCriteria?: PromotionCriteria;
 }
 
 /**
@@ -162,6 +260,33 @@ export function assertMinSharesOut(quotedShares: number, minSharesOut: number): 
   }
 }
 
+/**
+ * Evaluate the promotion gate for a shadow run. Returns the list of
+ * unmet criteria; an empty list means the strategy may be promoted to
+ * live allocation. Mirrors the backend gate so the operator console can
+ * block promotion when criteria are unmet.
+ */
+export function evaluatePromotionGate(
+  shadow: ShadowState,
+  criteria: PromotionCriteria,
+): string[] {
+  const unmet: string[] = [];
+  if (shadow.comparison.completedEpochs < criteria.minCompleteEpochs) {
+    unmet.push(
+      `Only ${shadow.comparison.completedEpochs}/${criteria.minCompleteEpochs} complete epochs`,
+    );
+  }
+  if (Math.abs(shadow.comparison.shadowVsExpectedDelta) > criteria.maxNavDeviation) {
+    unmet.push(
+      `NAV deviation ${shadow.comparison.shadowVsExpectedDelta} exceeds bound ${criteria.maxNavDeviation}`,
+    );
+  }
+  if (criteria.invariantViolations > 0) {
+    unmet.push(`${criteria.invariantViolations} invariant violation(s) recorded`);
+  }
+  return unmet;
+}
+
 // ---------------------------------------------------------------------------
 // Mock data
 // ---------------------------------------------------------------------------
@@ -172,6 +297,7 @@ const MOCK_VAULTS: VaultDetail[] = [
     name: "XLM Covered Call",
     underlying: "XLM",
     strategy: "covered_call",
+    mode: "live",
     apy: 0.22,
     apyMethodology: "Trailing 12-month annualized premium income ÷ average TVL. Does not include spot price change of the underlying.",
     tvl: 284000,
@@ -198,81 +324,4 @@ const MOCK_VAULTS: VaultDetail[] = [
     payoffExplanation: "Each week the vault sells a call option at a strike ~10% above the current XLM price. If XLM stays below the strike, depositors keep the full premium. If XLM rallies above the strike, the position is exercised and depositors participate in the upside up to the strike, giving up gains beyond it.",
     historicalEpochs: [
       { epochNumber: 46, depositStart: "2026-09-19", activeStart: "2026-09-20", settlementDate: "2026-09-27", strike: 0.125, expiryDays: 7, premiumCollected: 0.0018, outcome: "expired_worthless", pnlPct: 0.021 },
-      { epochNumber: 45, depositStart: "2026-09-12", activeStart: "2026-09-13", settlementDate: "2026-09-20", strike: 0.122, expiryDays: 7, premiumCollected: 0.0015, outcome: "expired_worthless", pnlPct: 0.018 },
-      { epochNumber: 44, depositStart: "2026-09-05", activeStart: "2026-09-06", settlementDate: "2026-09-13", strike: 0.118, expiryDays: 7, premiumCollected: 0.0021, outcome: "exercised",         pnlPct: 0.009 },
-      { epochNumber: 43, depositStart: "2026-08-29", activeStart: "2026-08-30", settlementDate: "2026-09-06", strike: 0.115, expiryDays: 7, premiumCollected: 0.0019, outcome: "expired_worthless", pnlPct: 0.022 },
-      { epochNumber: 42, depositStart: "2026-08-22", activeStart: "2026-08-23", settlementDate: "2026-08-30", strike: 0.120, expiryDays: 7, premiumCollected: 0.0016, outcome: "expired_worthless", pnlPct: 0.019 },
-    ],
-    userPosition: { shares: 950, shareValue: 1.042, totalValue: 989.9, accruedPremium: 18.46, pendingWithdrawal: 0 },
-  },
-  {
-    id: "btc-csp-v1",
-    name: "BTC Cash-Secured Put",
-    underlying: "BTC",
-    strategy: "cash_secured_put",
-    apy: 0.15,
-    apyMethodology: "Trailing 12-month annualized premium income ÷ average USDC TVL. Excludes BTC spot risk — depositors are exposed to assignment at the strike price.",
-    tvl: 1850000,
-    capacity: 3000000,
-    currentStrike: 60000,
-    currentExpiry: "2026-10-17",
-    riskRating: "high",
-    description: "Writes monthly cash-secured puts on BTC. The vault holds USDC as collateral; assignment means acquiring BTC at the strike.",
-    currentEpoch: 18,
-    currentPhase: "active",
-    phaseEndsAt: "2026-10-17T20:00:00Z",
-    sharePrice: 1.088,
-    totalShares: 1700368,
-    bookValue: 1850000,
-    feeStructure: { managementPct: 0.5, performancePct: 15 },
-    inflationDefense: {
-      virtualShares: 1e6,
-      virtualAssets: 1,
-      minFirstDeposit: 100,
-      deadShares: 1000,
-      navJumpGuardPct: 0.05,
-      directTransferPolicy: "ignored",
-    },
-    payoffExplanation: "Each month the vault sells a put option at a strike ~10% below the current BTC price, backed by USDC. If BTC stays above the strike, depositors keep the premium. If BTC falls below the strike, the vault is assigned and acquires BTC at the strike — a risk equivalent to a limit buy order.",
-    historicalEpochs: [
-      { epochNumber: 17, depositStart: "2026-08-15", activeStart: "2026-08-19", settlementDate: "2026-09-20", strike: 59000, expiryDays: 30, premiumCollected: 420, outcome: "expired_worthless", pnlPct: 0.013 },
-      { epochNumber: 16, depositStart: "2026-07-18", activeStart: "2026-07-22", settlementDate: "2026-08-16", strike: 55000, expiryDays: 30, premiumCollected: 380, outcome: "expired_worthless", pnlPct: 0.011 },
-      { epochNumber: 15, depositStart: "2026-06-21", activeStart: "2026-06-24", settlementDate: "2026-07-19", strike: 57000, expiryDays: 30, premiumCollected: 440, outcome: "expired_worthless", pnlPct: 0.014 },
-    ],
-    userPosition: null,
-  },
-  {
-    id: "eth-ic-v1",
-    name: "ETH Iron Condor",
-    underlying: "ETH",
-    strategy: "iron_condor",
-    apy: 0.18,
-    apyMethodology: "Trailing 12-month net premium income (both spreads) ÷ average USDC collateral deployed.",
-    tvl: 620000,
-    capacity: 1000000,
-    currentStrike: 3200,
-    currentExpiry: "2026-10-10",
-    riskRating: "low",
-    description: "Sells 30-day iron condors on ETH, targeting a range-bound market. Limited loss profile; wins when ETH stays between the two breakevens.",
-    currentEpoch: 11,
-    currentPhase: "deposit",
-    phaseEndsAt: "2026-09-28T12:00:00Z",
-    sharePrice: 1.021,
-    totalShares: 607247,
-    bookValue: 620000,
-    feeStructure: { managementPct: 0, performancePct: 10 },
-    inflationDefense: {
-      virtualShares: 1e6,
-      virtualAssets: 1,
-      minFirstDeposit: 100,
-      deadShares: 1000,
-      navJumpGuardPct: 0.05,
-      directTransferPolicy: "ignored",
-    },
-    payoffExplanation: "The vault simultaneously sells an out-of-the-money call spread and a put spread on ETH. Maximum profit is the combined net premium, achieved if ETH expires between the two short strikes. Maximum loss is limited to the spread width minus the premium.",
-    historicalEpochs: [
-      { epochNumber: 10, depositStart: "2026-08-25", activeStart: "2026-08-29", settlementDate: "2026-09-28", strike: 3100, expiryDays: 30, premiumCollected: 28, outcome: "expired_worthless", pnlPct: 0.012 },
-    ],
-    userPosition: null,
-  },
-];
+      { epochNumber: 45, depositStart: "2026-09-12", activeStart: "2026-09-13", settlementDate: "2026-09-20", strike: 
