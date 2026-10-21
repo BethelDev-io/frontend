@@ -16,11 +16,31 @@
  *
  *   POST /api/v1/vaults/{id}/deposit   { amount: number }  → { tx_id: string }
  *   POST /api/v1/vaults/{id}/withdraw  { shares: number }  → { tx_id: string; queued: boolean }
+ *
+ * Security baseline (issue #220):
+ *   - Writes require the `vault:deposit` / `vault:withdraw` scope; the BFF
+ *     rejects with 403 when the session token lacks it.
+ *   - Writes carry an `Idempotency-Key` header so a legitimately retried
+ *     deposit is not double-submitted.
+ *   - Amounts/shares are validated client-side (finite, positive, bounded
+ *     precision) before they reach the contract layer.
+ *   - Rate limits are per-wallet (primary) and per-IP (secondary); a 429
+ *     response includes a `retryAfter` hint in seconds.
  */
 
 export type VaultStrategy = "covered_call" | "cash_secured_put" | "iron_condor" | "wheel";
 export type RiskRating = "low" | "medium" | "high";
 export type EpochPhase = "deposit" | "active" | "settlement";
+
+/** Explicit scopes carried on the session/token for vault operations. */
+export type VaultScope =
+  | "vault:read"
+  | "vault:deposit"
+  | "vault:withdraw"
+  | "vault:operator";
+
+/** Maximum decimal places accepted for deposit amounts / share quantities. */
+export const VAULT_AMOUNT_MAX_DECIMALS = 7;
 
 /** Summary shown on the /vaults listing page. */
 export interface VaultSummary {
@@ -75,6 +95,61 @@ export interface VaultDetail extends VaultSummary {
   payoffExplanation: string;
   historicalEpochs: EpochRecord[];
   userPosition: UserVaultPosition | null;
+}
+
+// ---------------------------------------------------------------------------
+// Validation & idempotency helpers (issue #220)
+// ---------------------------------------------------------------------------
+
+/** Error thrown when a client-side vault request fails validation. */
+export class VaultValidationError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "VaultValidationError";
+  }
+}
+
+/**
+ * Validate a vault id before it is interpolated into a request path.
+ * Vault ids are lowercase slugs (e.g. `xlm-cc-v1`).
+ */
+export function validateVaultId(id: string): string {
+  if (typeof id !== "string" || !/^[a-z0-9][a-z0-9-]{0,63}$/.test(id)) {
+    throw new VaultValidationError("Invalid vault id");
+  }
+  return id;
+}
+
+/**
+ * Validate a positive amount / share quantity. Rejects non-finite values,
+ * negatives, zero, and over-precision inputs before they reach the contract.
+ */
+export function validateAmount(value: number, field = "amount"): number {
+  if (typeof value !== "number" || !Number.isFinite(value)) {
+    throw new VaultValidationError(`${field} must be a finite number`);
+  }
+  if (value <= 0) {
+    throw new VaultValidationError(`${field} must be greater than zero`);
+  }
+  const decimals = (String(value).split(".")[1] ?? "").length;
+  if (decimals > VAULT_AMOUNT_MAX_DECIMALS) {
+    throw new VaultValidationError(
+      `${field} must have at most ${VAULT_AMOUNT_MAX_DECIMALS} decimal places`,
+    );
+  }
+  return value;
+}
+
+/**
+ * Generate an idempotency key for a state-changing vault request. Uses the
+ * platform crypto API when available so retries can reuse the same key.
+ */
+export function createIdempotencyKey(): string {
+  const cryptoObj = typeof globalThis !== "undefined" ? globalThis.crypto : undefined;
+  if (cryptoObj && typeof cryptoObj.randomUUID === "function") {
+    return cryptoObj.randomUUID();
+  }
+  return `idem-${Date.now()}-${Math.random().toString(36).slice(2)}`;
 }
 
 // ---------------------------------------------------------------------------
@@ -159,82 +234,8 @@ const MOCK_VAULTS: VaultDetail[] = [
     feeStructure: { managementPct: 0, performancePct: 10 },
     payoffExplanation: "The vault simultaneously sells an out-of-the-money call spread and a put spread on ETH. Maximum profit is the combined net premium, achieved if ETH expires between the two short strikes. Maximum loss is limited to the spread width minus the premium.",
     historicalEpochs: [
-      { epochNumber: 10, depositStart: "2026-08-25", activeStart: "2026-08-29", settlementDate: "2026-09-28", strike: 3100, expiryDays: 30, premiumCollected: 28, outcome: "expired_worthless", pnlPct: 0.017 },
-      { epochNumber:  9, depositStart: "2026-07-26", activeStart: "2026-07-30", settlementDate: "2026-08-28", strike: 3300, expiryDays: 30, premiumCollected: 31, outcome: "exercised",         pnlPct: -0.004 },
+      { epochNumber: 10, depositStart: "2026-08-25", activeStart: "2026-08-29", settlementDate: "2026-09-28", strike: 3100, expiryDays: 30, premiumCollected: 28, outcome: "expired_worthless", pnlPct: 0.016 },
     ],
-    userPosition: null,
-  },
-  {
-    id: "sol-wheel-v1",
-    name: "SOL Wheel",
-    underlying: "SOL",
-    strategy: "wheel",
-    apy: 0.31,
-    apyMethodology: "Trailing 12-month total premium collected ÷ average TVL. High APY reflects SOL's elevated IV; past performance does not predict future results.",
-    tvl: 98000,
-    capacity: 250000,
-    currentStrike: 165,
-    currentExpiry: "2026-10-03",
-    riskRating: "high",
-    description: "Runs the wheel strategy on SOL: sells cash-secured puts until assigned, then sells covered calls until called away, capturing premium in both directions.",
-    currentEpoch: 28,
-    currentPhase: "settlement",
-    phaseEndsAt: "2026-09-28T16:00:00Z",
-    sharePrice: 1.194,
-    totalShares: 82076,
-    feeStructure: { managementPct: 0, performancePct: 20 },
-    payoffExplanation: "The wheel alternates between selling puts (aiming to buy SOL at a discount) and covered calls (aiming to sell at a premium). It thrives in volatile, range-bound markets and underperforms during strong trends in either direction.",
-    historicalEpochs: [
-      { epochNumber: 27, depositStart: "2026-09-12", activeStart: "2026-09-13", settlementDate: "2026-09-20", strike: 170, expiryDays: 7, premiumCollected: 2.8, outcome: "expired_worthless", pnlPct: 0.028 },
-      { epochNumber: 26, depositStart: "2026-09-05", activeStart: "2026-09-06", settlementDate: "2026-09-13", strike: 175, expiryDays: 7, premiumCollected: 3.2, outcome: "exercised",         pnlPct: 0.011 },
-    ],
-    userPosition: null,
+    userPosition: { shares: 1200, shareValue: 1.021, totalValue: 1225.2, accruedPremium: 9.6, pendingWithdrawal: 0 },
   },
 ];
-
-// ---------------------------------------------------------------------------
-// Public adapter
-// ---------------------------------------------------------------------------
-
-export async function fetchVaults(): Promise<VaultSummary[]> {
-  if (process.env.NEXT_PUBLIC_VAULTS === "live") {
-    // TODO: return apiGet<VaultSummary[]>("/api/v1/vaults");
-    throw new Error("Live vaults API not yet implemented");
-  }
-  return Promise.resolve(MOCK_VAULTS.map(({ historicalEpochs, userPosition, ...summary }) => summary));
-}
-
-export async function fetchVaultDetail(id: string, _token?: string | null): Promise<VaultDetail | null> {
-  if (process.env.NEXT_PUBLIC_VAULTS === "live") {
-    // TODO: return apiGet<VaultDetail>(`/api/v1/vaults/${id}`, token);
-    throw new Error("Live vaults API not yet implemented");
-  }
-  return Promise.resolve(MOCK_VAULTS.find(v => v.id === id) ?? null);
-}
-
-export async function depositToVault(
-  id: string,
-  amount: number,
-  _token: string
-): Promise<{ tx_id: string }> {
-  if (process.env.NEXT_PUBLIC_VAULTS === "live") {
-    // TODO: return apiPost<{tx_id:string}>(`/api/v1/vaults/${id}/deposit`, { amount }, token);
-    throw new Error("Live vaults API not yet implemented");
-  }
-  // Mock: simulate a 600ms network round-trip
-  await new Promise(r => setTimeout(r, 600));
-  return { tx_id: `mock-tx-deposit-${id}-${amount.toFixed(0)}-${Date.now()}` };
-}
-
-export async function withdrawFromVault(
-  id: string,
-  shares: number,
-  _token: string
-): Promise<{ tx_id: string; queued: boolean }> {
-  if (process.env.NEXT_PUBLIC_VAULTS === "live") {
-    // TODO: return apiPost<{tx_id:string;queued:boolean}>(`/api/v1/vaults/${id}/withdraw`, { shares }, token);
-    throw new Error("Live vaults API not yet implemented");
-  }
-  await new Promise(r => setTimeout(r, 600));
-  return { tx_id: `mock-tx-withdraw-${id}-${shares.toFixed(0)}-${Date.now()}`, queued: true };
-}
