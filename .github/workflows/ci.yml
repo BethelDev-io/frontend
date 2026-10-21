@@ -189,6 +189,38 @@ jobs:
             test-results
           retention-days: 14
 
+  # ───────────────────────────────────────────────────────────────────────────
+  # RENDER PERFORMANCE (dev-only /__perf harness)
+  # Drives scripted vault NAV / queue-position / epoch ticks through the real
+  # SpotFeedContext provider and asserts recorded render counts against the
+  # documented baseline. Skips cleanly when no vault fixture data is available.
+  # ───────────────────────────────────────────────────────────────────────────
+  perf:
+    name: Render perf (vault render-count budgets)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+        env:
+          NEXT_TELEMETRY_DISABLED: "1"
+      - run: npx playwright install --with-deps chromium
+      - run: npx playwright test --config=playwright.perf.config.ts
+        env:
+          CI: "true"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: perf-report
+          path: |
+            perf-report
+            test-results
+          retention-days: 14
+
   lighthouse:
     name: Lighthouse (mobile perf ≥ 0.85, CLS < 0.05)
     runs-on: ubuntu-latest
@@ -256,18 +288,22 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      - name: Download Storybook build
+      - name: Download Storybook build artifact
         uses: actions/download-artifact@v4
         with:
           name: storybook-static
           path: storybook-static/
 
-      - name: Install Playwright Chromium
-        run: npx playwright install chromium --with-deps
+      - name: Install Playwright browsers
+        run: npx playwright install --with-deps chromium
 
       - name: Run Storybook test runner
         run: npm run storybook:test
-        env:
-          # Point the test runner at the static build served by the built-in
-          # reference server.
-          TARGET_URL: http://127.0.0.1:6006
+
+      - name: Upload test runner report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: storybook-test-report
+          path: storybook-test-report/
+          retention-days: 14
