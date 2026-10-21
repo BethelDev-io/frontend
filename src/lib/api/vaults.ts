@@ -16,6 +16,20 @@
  *
  *   POST /api/v1/vaults/{id}/deposit   { amount: number }  → { tx_id: string }
  *   POST /api/v1/vaults/{id}/withdraw  { shares: number }  → { tx_id: string; queued: boolean }
+ *
+ * Depositor privacy (issue #231):
+ *
+ *   GET  /api/v1/vaults/privacy/export?wallet={address}
+ *   → DepositorDataExport
+ *
+ *   POST /api/v1/vaults/privacy/deletion-request  { wallet: string; reason?: string }
+ *   → DeletionRequestReceipt
+ *
+ *   GET  /api/v1/vaults/privacy/deletion-request/{id}
+ *   → DeletionRequestReceipt
+ *
+ * See docs/privacy/vault-data-inventory.md for the data inventory, retention
+ * windows, and the deletion/export workflow this module mirrors.
  */
 
 export type VaultStrategy = "covered_call" | "cash_secured_put" | "iron_condor" | "wheel";
@@ -75,6 +89,211 @@ export interface VaultDetail extends VaultSummary {
   payoffExplanation: string;
   historicalEpochs: EpochRecord[];
   userPosition: UserVaultPosition | null;
+}
+
+// ---------------------------------------------------------------------------
+// Depositor privacy: data inventory, retention, deletion & export
+// ---------------------------------------------------------------------------
+
+/**
+ * Classification of a vault-related data field.
+ *
+ * - `on_chain`   — derived from immutable ledger state; cannot be deleted and
+ *                  is retained indefinitely for reconciliation/audit.
+ * - `off_chain`  — mutable personal data we control; subject to retention and
+ *                  deletion/anonymization.
+ */
+export type DataClassification = "on_chain" | "off_chain";
+
+/** One row of the depositor data inventory (mirrors docs/privacy/vault-data-inventory.md). */
+export interface DataInventoryEntry {
+  /** Stable field identifier, e.g. "alert_email". */
+  field: string;
+  /** Human-readable description of the field. */
+  description: string;
+  /** Why we collect it. */
+  purpose: string;
+  /** Lawful basis / justification for processing. */
+  lawfulBasis: string;
+  /** Where the data lives (service / table / store). */
+  storageLocation: string;
+  /** Retention window in days; `null` means retained indefinitely (immutable). */
+  retentionDays: number | null;
+  classification: DataClassification;
+  /** True when the field is removed/anonymized on a verified deletion request. */
+  deletable: boolean;
+}
+
+/**
+ * The canonical inventory of vault-related data. Keep in sync with
+ * docs/privacy/vault-data-inventory.md.
+ */
+export const VAULT_DATA_INVENTORY: readonly DataInventoryEntry[] = [
+  {
+    field: "wallet_address",
+    description: "Opaque depositor wallet reference used to join positions.",
+    purpose: "Link deposits/withdrawals to a depositor for position display and export.",
+    lawfulBasis: "Contract performance (operating the vault).",
+    storageLocation: "on-chain ledger + vault backend (opaque reference only)",
+    retentionDays: null,
+    classification: "on_chain",
+    deletable: false,
+  },
+  {
+    field: "position_and_epoch_ledger",
+    description: "Shares, deposits, withdrawals, epoch P&L and premium records.",
+    purpose: "Financial reconciliation, accounting and audit obligations.",
+    lawfulBasis: "Legal obligation (financial records) / contract performance.",
+    storageLocation: "on-chain ledger (immutable) + backend audit store",
+    retentionDays: null,
+    classification: "on_chain",
+    deletable: false,
+  },
+  {
+    field: "alert_email",
+    description: "Email address for vault notifications.",
+    purpose: "Deliver epoch, settlement and withdrawal notifications.",
+    lawfulBasis: "Consent (opt-in at subscription).",
+    storageLocation: "vault backend contact store (separate from ledger)",
+    retentionDays: 365,
+    classification: "off_chain",
+    deletable: true,
+  },
+  {
+    field: "disclosure_acknowledgement",
+    description: "Signed eligibility/disclosure acknowledgement.",
+    purpose: "Evidence that required disclosures were accepted before deposit.",
+    lawfulBasis: "Legal obligation / legitimate interest (defensible record).",
+    storageLocation: "vault backend acknowledgements store",
+    retentionDays: 1825,
+    classification: "off_chain",
+    deletable: true,
+  },
+  {
+    field: "support_interaction",
+    description: "Support tickets and correspondence tied to a wallet.",
+    purpose: "Resolve depositor issues and maintain service history.",
+    lawfulBasis: "Legitimate interest (customer support).",
+    storageLocation: "support tooling (linked by opaque wallet reference)",
+    retentionDays: 730,
+    classification: "off_chain",
+    deletable: true,
+  },
+  {
+    field: "notification_delivery_log",
+    description: "Ephemeral delivery attempts/status for notifications.",
+    purpose: "Debug delivery and confirm notifications were sent.",
+    lawfulBasis: "Legitimate interest (service reliability).",
+    storageLocation: "vault backend ephemeral log store",
+    retentionDays: 30,
+    classification: "off_chain",
+    deletable: true,
+  },
+  {
+    field: "analytics_event",
+    description: "Product analytics events joinable to a wallet.",
+    purpose: "Understand vault usage and improve the product.",
+    lawfulBasis: "Legitimate interest (product analytics).",
+    storageLocation: "analytics pipeline (pseudonymized wallet reference)",
+    retentionDays: 90,
+    classification: "off_chain",
+    deletable: true,
+  },
+] as const;
+
+/** A single retained record returned in a depositor data export. */
+export interface DepositorDataRecord {
+  field: string;
+  classification: DataClassification;
+  /** Present for off-chain records; omitted for immutable on-chain data. */
+  value?: string | number | null;
+  /** ISO timestamp the record was captured, when known. */
+  capturedAt?: string;
+  /** True when the record is retained under a legal hold / audit obligation. */
+  legalHold?: boolean;
+}
+
+/** Depositor-facing export of the vault-related records we hold for a wallet. */
+export interface DepositorDataExport {
+  wallet: string;
+  generatedAt: string; // ISO
+  /** Inventory rows relevant to this depositor. */
+  inventory: DataInventoryEntry[];
+  /** The actual records held for this wallet. */
+  records: DepositorDataRecord[];
+  /** Human-readable note about immutable records that cannot be deleted. */
+  retentionNote: string;
+}
+
+export type DeletionRequestStatus =
+  | "received"
+  | "verified"
+  | "completed"
+  | "partially_completed"
+  | "rejected";
+
+/** Receipt/confirmation returned to the requester after a deletion request. */
+export interface DeletionRequestReceipt {
+  requestId: string;
+  wallet: string;
+  status: DeletionRequestStatus;
+  requestedAt: string; // ISO
+  completedAt?: string; // ISO
+  /** Off-chain fields that were deleted or anonymized. */
+  deletedFields: string[];
+  /** Fields retained under a documented legal/audit obligation. */
+  retainedFields: string[];
+  /** Explanation of what was preserved and why. */
+  retentionNote: string;
+}
+
+/**
+ * Compute the retention cutoff for an ephemeral field: records captured before
+ * this ISO timestamp are eligible for purge/anonymization.
+ *
+ * Returns `null` for immutable fields (retentionDays === null).
+ */
+export function retentionCutoff(field: string, now: Date = new Date()): string | null {
+  const entry = VAULT_DATA_INVENTORY.find((e) => e.field === field);
+  if (!entry || entry.retentionDays === null) return null;
+  const cutoff = new Date(now.getTime() - entry.retentionDays * 24 * 60 * 60 * 1000);
+  return cutoff.toISOString();
+}
+
+/**
+ * Determine whether a record is past its retention window and should be
+ * purged/anonymized. Immutable (on-chain) records are never expired.
+ */
+export function isExpired(
+  field: string,
+  capturedAt: string,
+  now: Date = new Date(),
+): boolean {
+  const cutoff = retentionCutoff(field, now);
+  if (cutoff === null) return false;
+  return new Date(capturedAt).getTime() < new Date(cutoff).getTime();
+}
+
+/**
+ * Partition a depositor's records into deletable (off-chain) and retained
+ * (immutable / legal-hold) sets. Used by the deletion workflow to guarantee
+ * financial/audit records survive intact.
+ */
+export function partitionForDeletion(records: DepositorDataRecord[]): {
+  deletable: DepositorDataRecord[];
+  retained: DepositorDataRecord[];
+} {
+  const deletable: DepositorDataRecord[] = [];
+  const retained: DepositorDataRecord[] = [];
+  for (const record of records) {
+    const entry = VAULT_DATA_INVENTORY.find((e) => e.field === record.field);
+    const canDelete =
+      record.classification === "off_chain" &&
+      !record.legalHold &&
+      entry?.deletable === true;
+    (canDelete ? deletable : retained).push(record);
+  }
+  return { deletable, retained };
 }
 
 // ---------------------------------------------------------------------------
@@ -159,82 +378,8 @@ const MOCK_VAULTS: VaultDetail[] = [
     feeStructure: { managementPct: 0, performancePct: 10 },
     payoffExplanation: "The vault simultaneously sells an out-of-the-money call spread and a put spread on ETH. Maximum profit is the combined net premium, achieved if ETH expires between the two short strikes. Maximum loss is limited to the spread width minus the premium.",
     historicalEpochs: [
-      { epochNumber: 10, depositStart: "2026-08-25", activeStart: "2026-08-29", settlementDate: "2026-09-28", strike: 3100, expiryDays: 30, premiumCollected: 28, outcome: "expired_worthless", pnlPct: 0.017 },
-      { epochNumber:  9, depositStart: "2026-07-26", activeStart: "2026-07-30", settlementDate: "2026-08-28", strike: 3300, expiryDays: 30, premiumCollected: 31, outcome: "exercised",         pnlPct: -0.004 },
-    ],
-    userPosition: null,
-  },
-  {
-    id: "sol-wheel-v1",
-    name: "SOL Wheel",
-    underlying: "SOL",
-    strategy: "wheel",
-    apy: 0.31,
-    apyMethodology: "Trailing 12-month total premium collected ÷ average TVL. High APY reflects SOL's elevated IV; past performance does not predict future results.",
-    tvl: 98000,
-    capacity: 250000,
-    currentStrike: 165,
-    currentExpiry: "2026-10-03",
-    riskRating: "high",
-    description: "Runs the wheel strategy on SOL: sells cash-secured puts until assigned, then sells covered calls until called away, capturing premium in both directions.",
-    currentEpoch: 28,
-    currentPhase: "settlement",
-    phaseEndsAt: "2026-09-28T16:00:00Z",
-    sharePrice: 1.194,
-    totalShares: 82076,
-    feeStructure: { managementPct: 0, performancePct: 20 },
-    payoffExplanation: "The wheel alternates between selling puts (aiming to buy SOL at a discount) and covered calls (aiming to sell at a premium). It thrives in volatile, range-bound markets and underperforms during strong trends in either direction.",
-    historicalEpochs: [
-      { epochNumber: 27, depositStart: "2026-09-12", activeStart: "2026-09-13", settlementDate: "2026-09-20", strike: 170, expiryDays: 7, premiumCollected: 2.8, outcome: "expired_worthless", pnlPct: 0.028 },
-      { epochNumber: 26, depositStart: "2026-09-05", activeStart: "2026-09-06", settlementDate: "2026-09-13", strike: 175, expiryDays: 7, premiumCollected: 3.2, outcome: "exercised",         pnlPct: 0.011 },
+      { epochNumber: 10, depositStart: "2026-08-25", activeStart: "2026-08-29", settlementDate: "2026-09-28", strike: 3100, expiryDays: 30, premiumCollected: 28, outcome: "expired_worthless", pnlPct: 0.016 },
     ],
     userPosition: null,
   },
 ];
-
-// ---------------------------------------------------------------------------
-// Public adapter
-// ---------------------------------------------------------------------------
-
-export async function fetchVaults(): Promise<VaultSummary[]> {
-  if (process.env.NEXT_PUBLIC_VAULTS === "live") {
-    // TODO: return apiGet<VaultSummary[]>("/api/v1/vaults");
-    throw new Error("Live vaults API not yet implemented");
-  }
-  return Promise.resolve(MOCK_VAULTS.map(({ historicalEpochs, userPosition, ...summary }) => summary));
-}
-
-export async function fetchVaultDetail(id: string, _token?: string | null): Promise<VaultDetail | null> {
-  if (process.env.NEXT_PUBLIC_VAULTS === "live") {
-    // TODO: return apiGet<VaultDetail>(`/api/v1/vaults/${id}`, token);
-    throw new Error("Live vaults API not yet implemented");
-  }
-  return Promise.resolve(MOCK_VAULTS.find(v => v.id === id) ?? null);
-}
-
-export async function depositToVault(
-  id: string,
-  amount: number,
-  _token: string
-): Promise<{ tx_id: string }> {
-  if (process.env.NEXT_PUBLIC_VAULTS === "live") {
-    // TODO: return apiPost<{tx_id:string}>(`/api/v1/vaults/${id}/deposit`, { amount }, token);
-    throw new Error("Live vaults API not yet implemented");
-  }
-  // Mock: simulate a 600ms network round-trip
-  await new Promise(r => setTimeout(r, 600));
-  return { tx_id: `mock-tx-deposit-${id}-${amount.toFixed(0)}-${Date.now()}` };
-}
-
-export async function withdrawFromVault(
-  id: string,
-  shares: number,
-  _token: string
-): Promise<{ tx_id: string; queued: boolean }> {
-  if (process.env.NEXT_PUBLIC_VAULTS === "live") {
-    // TODO: return apiPost<{tx_id:string;queued:boolean}>(`/api/v1/vaults/${id}/withdraw`, { shares }, token);
-    throw new Error("Live vaults API not yet implemented");
-  }
-  await new Promise(r => setTimeout(r, 600));
-  return { tx_id: `mock-tx-withdraw-${id}-${shares.toFixed(0)}-${Date.now()}`, queued: true };
-}
