@@ -16,11 +16,55 @@
  *
  *   POST /api/v1/vaults/{id}/deposit   { amount: number }  → { tx_id: string }
  *   POST /api/v1/vaults/{id}/withdraw  { shares: number }  → { tx_id: string; queued: boolean }
+ *
+ * NAV / share-price source of truth (issue #290):
+ *
+ *   Share issuance is priced from the vault's internal book value
+ *   (`bookValue`), NOT from the raw token balance held at the vault
+ *   contract address. Direct token transfers to the contract are
+ *   classified as `ignored` — they do not move NAV and cannot be used
+ *   to inflate the share price. This classification is identical across
+ *   the contract, the backend indexer/registry, and this adapter.
+ *
+ *   Inflation / donation-attack mitigations are per-vault config
+ *   (`inflationDefense`) and are changeable only through the timelocked
+ *   operator path. The adapter surfaces them so the UI can enforce the
+ *   same `minSharesOut` bound the contract enforces on deposit.
  */
 
 export type VaultStrategy = "covered_call" | "cash_secured_put" | "iron_condor" | "wheel";
 export type RiskRating = "low" | "medium" | "high";
 export type EpochPhase = "deposit" | "active" | "settlement";
+
+/**
+ * How a direct token transfer to the vault contract address is treated.
+ * Must match the contract and backend indexer/registry exactly.
+ *
+ * - `ignored`: transfer does not affect NAV (default; donation-resistant).
+ * - `swept`: transfer is moved to a defined sink address.
+ * - `windfall`: transfer is absorbed into book value (opt-in only).
+ */
+export type DirectTransferPolicy = "ignored" | "swept" | "windfall";
+
+/**
+ * Per-vault inflation / donation-attack defense parameters.
+ * Stored with the rest of the vault parameters and mutable only via the
+ * timelocked operator path — never hardcoded constants.
+ */
+export interface InflationDefenseConfig {
+  /** Virtual shares added to total supply in the pricing formula. */
+  virtualShares: number;
+  /** Virtual assets added to book value in the pricing formula. */
+  virtualAssets: number;
+  /** Minimum assets required for the first (genesis) deposit. */
+  minFirstDeposit: number;
+  /** Shares minted to the dead/locked address on the first deposit. */
+  deadShares: number;
+  /** Max fractional NAV-per-share move between issuance events in one ledger (0–1). */
+  navJumpGuardPct: number;
+  /** Classification of direct token transfers to the contract. */
+  directTransferPolicy: DirectTransferPolicy;
+}
 
 /** Summary shown on the /vaults listing page. */
 export interface VaultSummary {
@@ -71,10 +115,51 @@ export interface VaultDetail extends VaultSummary {
   phaseEndsAt: string; // ISO — when the current phase ends
   sharePrice: number; // current NAV per share in USD
   totalShares: number;
+  /** Internal book value backing shares (source of truth for NAV). */
+  bookValue: number;
   feeStructure: { managementPct: number; performancePct: number };
+  /** Per-vault inflation / donation-attack defense parameters. */
+  inflationDefense: InflationDefenseConfig;
   payoffExplanation: string;
   historicalEpochs: EpochRecord[];
   userPosition: UserVaultPosition | null;
+}
+
+/**
+ * Compute the number of shares minted for a deposit, using the same
+ * virtual-offset integer formula as the contract. NAV is derived from
+ * internal book value only — never from the raw token balance.
+ *
+ * shares = amount * (totalShares + virtualShares) / (bookValue + virtualAssets)
+ *
+ * Returns 0 when the deposit would round to zero shares, so callers can
+ * reject it rather than silently forfeiting the depositor's assets.
+ */
+export function quoteSharesOut(
+  amount: number,
+  bookValue: number,
+  totalShares: number,
+  defense: Pick<InflationDefenseConfig, "virtualShares" | "virtualAssets">,
+): number {
+  if (amount <= 0) return 0;
+  const denom = bookValue + defense.virtualAssets;
+  if (denom <= 0) return 0;
+  return Math.floor((amount * (totalShares + defense.virtualShares)) / denom);
+}
+
+/**
+ * Enforce the per-deposit `minSharesOut` bound in the deposit path.
+ * Throws if the quoted shares fall below the caller's bound or round to
+ * zero, guaranteeing honest depositors never receive zero shares for a
+ * non-zero deposit.
+ */
+export function assertMinSharesOut(quotedShares: number, minSharesOut: number): void {
+  if (quotedShares <= 0) {
+    throw new Error("Deposit would mint zero shares; increase amount or lower NAV impact");
+  }
+  if (quotedShares < minSharesOut) {
+    throw new Error(`Slippage: quoted ${quotedShares} shares < minSharesOut ${minSharesOut}`);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -100,7 +185,16 @@ const MOCK_VAULTS: VaultDetail[] = [
     phaseEndsAt: "2026-10-03T16:00:00Z",
     sharePrice: 1.042,
     totalShares: 272552,
+    bookValue: 284000,
     feeStructure: { managementPct: 0, performancePct: 10 },
+    inflationDefense: {
+      virtualShares: 1e6,
+      virtualAssets: 1,
+      minFirstDeposit: 100,
+      deadShares: 1000,
+      navJumpGuardPct: 0.05,
+      directTransferPolicy: "ignored",
+    },
     payoffExplanation: "Each week the vault sells a call option at a strike ~10% above the current XLM price. If XLM stays below the strike, depositors keep the full premium. If XLM rallies above the strike, the position is exercised and depositors participate in the upside up to the strike, giving up gains beyond it.",
     historicalEpochs: [
       { epochNumber: 46, depositStart: "2026-09-19", activeStart: "2026-09-20", settlementDate: "2026-09-27", strike: 0.125, expiryDays: 7, premiumCollected: 0.0018, outcome: "expired_worthless", pnlPct: 0.021 },
@@ -129,7 +223,16 @@ const MOCK_VAULTS: VaultDetail[] = [
     phaseEndsAt: "2026-10-17T20:00:00Z",
     sharePrice: 1.088,
     totalShares: 1700368,
+    bookValue: 1850000,
     feeStructure: { managementPct: 0.5, performancePct: 15 },
+    inflationDefense: {
+      virtualShares: 1e6,
+      virtualAssets: 1,
+      minFirstDeposit: 100,
+      deadShares: 1000,
+      navJumpGuardPct: 0.05,
+      directTransferPolicy: "ignored",
+    },
     payoffExplanation: "Each month the vault sells a put option at a strike ~10% below the current BTC price, backed by USDC. If BTC stays above the strike, depositors keep the premium. If BTC falls below the strike, the vault is assigned and acquires BTC at the strike — a risk equivalent to a limit buy order.",
     historicalEpochs: [
       { epochNumber: 17, depositStart: "2026-08-15", activeStart: "2026-08-19", settlementDate: "2026-09-20", strike: 59000, expiryDays: 30, premiumCollected: 420, outcome: "expired_worthless", pnlPct: 0.013 },
@@ -156,85 +259,20 @@ const MOCK_VAULTS: VaultDetail[] = [
     phaseEndsAt: "2026-09-28T12:00:00Z",
     sharePrice: 1.021,
     totalShares: 607247,
+    bookValue: 620000,
     feeStructure: { managementPct: 0, performancePct: 10 },
+    inflationDefense: {
+      virtualShares: 1e6,
+      virtualAssets: 1,
+      minFirstDeposit: 100,
+      deadShares: 1000,
+      navJumpGuardPct: 0.05,
+      directTransferPolicy: "ignored",
+    },
     payoffExplanation: "The vault simultaneously sells an out-of-the-money call spread and a put spread on ETH. Maximum profit is the combined net premium, achieved if ETH expires between the two short strikes. Maximum loss is limited to the spread width minus the premium.",
     historicalEpochs: [
-      { epochNumber: 10, depositStart: "2026-08-25", activeStart: "2026-08-29", settlementDate: "2026-09-28", strike: 3100, expiryDays: 30, premiumCollected: 28, outcome: "expired_worthless", pnlPct: 0.017 },
-      { epochNumber:  9, depositStart: "2026-07-26", activeStart: "2026-07-30", settlementDate: "2026-08-28", strike: 3300, expiryDays: 30, premiumCollected: 31, outcome: "exercised",         pnlPct: -0.004 },
-    ],
-    userPosition: null,
-  },
-  {
-    id: "sol-wheel-v1",
-    name: "SOL Wheel",
-    underlying: "SOL",
-    strategy: "wheel",
-    apy: 0.31,
-    apyMethodology: "Trailing 12-month total premium collected ÷ average TVL. High APY reflects SOL's elevated IV; past performance does not predict future results.",
-    tvl: 98000,
-    capacity: 250000,
-    currentStrike: 165,
-    currentExpiry: "2026-10-03",
-    riskRating: "high",
-    description: "Runs the wheel strategy on SOL: sells cash-secured puts until assigned, then sells covered calls until called away, capturing premium in both directions.",
-    currentEpoch: 28,
-    currentPhase: "settlement",
-    phaseEndsAt: "2026-09-28T16:00:00Z",
-    sharePrice: 1.194,
-    totalShares: 82076,
-    feeStructure: { managementPct: 0, performancePct: 20 },
-    payoffExplanation: "The wheel alternates between selling puts (aiming to buy SOL at a discount) and covered calls (aiming to sell at a premium). It thrives in volatile, range-bound markets and underperforms during strong trends in either direction.",
-    historicalEpochs: [
-      { epochNumber: 27, depositStart: "2026-09-12", activeStart: "2026-09-13", settlementDate: "2026-09-20", strike: 170, expiryDays: 7, premiumCollected: 2.8, outcome: "expired_worthless", pnlPct: 0.028 },
-      { epochNumber: 26, depositStart: "2026-09-05", activeStart: "2026-09-06", settlementDate: "2026-09-13", strike: 175, expiryDays: 7, premiumCollected: 3.2, outcome: "exercised",         pnlPct: 0.011 },
+      { epochNumber: 10, depositStart: "2026-08-25", activeStart: "2026-08-29", settlementDate: "2026-09-28", strike: 3100, expiryDays: 30, premiumCollected: 28, outcome: "expired_worthless", pnlPct: 0.012 },
     ],
     userPosition: null,
   },
 ];
-
-// ---------------------------------------------------------------------------
-// Public adapter
-// ---------------------------------------------------------------------------
-
-export async function fetchVaults(): Promise<VaultSummary[]> {
-  if (process.env.NEXT_PUBLIC_VAULTS === "live") {
-    // TODO: return apiGet<VaultSummary[]>("/api/v1/vaults");
-    throw new Error("Live vaults API not yet implemented");
-  }
-  return Promise.resolve(MOCK_VAULTS.map(({ historicalEpochs, userPosition, ...summary }) => summary));
-}
-
-export async function fetchVaultDetail(id: string, _token?: string | null): Promise<VaultDetail | null> {
-  if (process.env.NEXT_PUBLIC_VAULTS === "live") {
-    // TODO: return apiGet<VaultDetail>(`/api/v1/vaults/${id}`, token);
-    throw new Error("Live vaults API not yet implemented");
-  }
-  return Promise.resolve(MOCK_VAULTS.find(v => v.id === id) ?? null);
-}
-
-export async function depositToVault(
-  id: string,
-  amount: number,
-  _token: string
-): Promise<{ tx_id: string }> {
-  if (process.env.NEXT_PUBLIC_VAULTS === "live") {
-    // TODO: return apiPost<{tx_id:string}>(`/api/v1/vaults/${id}/deposit`, { amount }, token);
-    throw new Error("Live vaults API not yet implemented");
-  }
-  // Mock: simulate a 600ms network round-trip
-  await new Promise(r => setTimeout(r, 600));
-  return { tx_id: `mock-tx-deposit-${id}-${amount.toFixed(0)}-${Date.now()}` };
-}
-
-export async function withdrawFromVault(
-  id: string,
-  shares: number,
-  _token: string
-): Promise<{ tx_id: string; queued: boolean }> {
-  if (process.env.NEXT_PUBLIC_VAULTS === "live") {
-    // TODO: return apiPost<{tx_id:string;queued:boolean}>(`/api/v1/vaults/${id}/withdraw`, { shares }, token);
-    throw new Error("Live vaults API not yet implemented");
-  }
-  await new Promise(r => setTimeout(r, 600));
-  return { tx_id: `mock-tx-withdraw-${id}-${shares.toFixed(0)}-${Date.now()}`, queued: true };
-}
