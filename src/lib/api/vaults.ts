@@ -8,14 +8,25 @@
  *
  * Backend contract (for when the real API lands):
  *
- *   GET /api/v1/vaults
- *   → VaultSummary[]
+ *   GET /api/v1/vaults?cursor=<opaque>&limit=<n>
+ *   → { items: VaultSummary[]; nextCursor: string | null; cache: CacheMeta }
  *
  *   GET /api/v1/vaults/{id}
  *   → VaultDetail
  *
+ *   GET /api/v1/vaults/{id}/epochs?cursor=<opaque>&limit=<n>
+ *   → { items: EpochRecord[]; nextCursor: string | null; cache: CacheMeta }
+ *
  *   POST /api/v1/vaults/{id}/deposit   { amount: number }  → { tx_id: string }
  *   POST /api/v1/vaults/{id}/withdraw  { shares: number }  → { tx_id: string; queued: boolean }
+ *
+ * Pagination & caching (issue #223):
+ *   - List and epoch-history reads are cursor-paginated (never offset). The
+ *     cursor is an opaque token over a stable sort key (vault id / epoch
+ *     number), so inserting a new epoch mid-pagination neither skips nor
+ *     duplicates rows. Page size is capped at VAULT_MAX_PAGE_SIZE.
+ *   - Responses carry `cache` freshness metadata so the UI can show whether
+ *     NAV values are live or served from cache.
  *
  * Security baseline (issue #220):
  *   - Writes require the `vault:deposit` / `vault:withdraw` scope; the BFF
@@ -41,6 +52,12 @@ export type VaultScope =
 
 /** Maximum decimal places accepted for deposit amounts / share quantities. */
 export const VAULT_AMOUNT_MAX_DECIMALS = 7;
+
+/** Hard cap on page size for cursor-paginated vault/epoch reads. */
+export const VAULT_MAX_PAGE_SIZE = 100;
+
+/** Default page size when the caller does not specify one. */
+export const VAULT_DEFAULT_PAGE_SIZE = 25;
 
 /** Summary shown on the /vaults listing page. */
 export interface VaultSummary {
@@ -95,6 +112,103 @@ export interface VaultDetail extends VaultSummary {
   payoffExplanation: string;
   historicalEpochs: EpochRecord[];
   userPosition: UserVaultPosition | null;
+}
+
+// ---------------------------------------------------------------------------
+// Pagination & cache metadata (issue #223)
+// ---------------------------------------------------------------------------
+
+/**
+ * Freshness metadata attached to every paginated read. `stale` is true when
+ * the payload was served from cache and may not reflect the latest chain
+ * state (e.g. a NAV value computed before the current epoch ticked).
+ */
+export interface CacheMeta {
+  /** Whether the payload was served from a cache layer. */
+  cached: boolean;
+  /** ISO timestamp of when the underlying data was produced. */
+  asOf: string;
+  /** Seconds the payload may be considered fresh. 0 = live. */
+  ttlSeconds: number;
+  /** True when the payload is cached and past its freshness window. */
+  stale: boolean;
+}
+
+/** A single page of results plus the cursor to fetch the next page. */
+export interface VaultPage<T> {
+  items: T[];
+  /** Opaque cursor for the next page, or null when the end is reached. */
+  nextCursor: string | null;
+  cache: CacheMeta;
+}
+
+/** Options accepted by the paginated read helpers. */
+export interface PageOptions {
+  /** Opaque cursor returned by a previous page. Omit for the first page. */
+  cursor?: string | null;
+  /** Requested page size; clamped to [1, VAULT_MAX_PAGE_SIZE]. */
+  limit?: number;
+}
+
+/**
+ * Clamp a requested page size into the documented bounds. Exported so the BFF
+ * route handlers apply the exact same cap as the client.
+ */
+export function clampPageSize(limit?: number): number {
+  if (limit === undefined || limit === null || !Number.isFinite(limit)) {
+    return VAULT_DEFAULT_PAGE_SIZE;
+  }
+  const n = Math.floor(limit);
+  if (n < 1) return 1;
+  if (n > VAULT_MAX_PAGE_SIZE) return VAULT_MAX_PAGE_SIZE;
+  return n;
+}
+
+/**
+ * Encode an opaque cursor over a stable sort key. The key is the last-seen
+ * value of the sort column (vault id or epoch number), never a timestamp, so
+ * concurrent inserts do not shift page boundaries.
+ */
+export function encodeCursor(key: string | number): string {
+  const raw = String(key);
+  const b64 =
+    typeof btoa === "function"
+      ? btoa(raw)
+      : Buffer.from(raw, "utf8").toString("base64");
+  return b64.replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+
+/** Decode an opaque cursor produced by {@link encodeCursor}. */
+export function decodeCursor(cursor: string): string {
+  const b64 = cursor.replace(/-/g, "+").replace(/_/g, "/");
+  const padded = b64 + "=".repeat((4 - (b64.length % 4)) % 4);
+  return typeof atob === "function"
+    ? atob(padded)
+    : Buffer.from(padded, "base64").toString("utf8");
+}
+
+/**
+ * Slice a stable-sorted array into a cursor page. `keyOf` returns the stable
+ * sort key for each item; the cursor encodes the last key of the prior page.
+ * Items are returned strictly after the cursor key, so a row inserted before
+ * the cursor is not re-emitted and a row inserted after it is not skipped.
+ */
+export function paginateByKey<T>(
+  items: T[],
+  keyOf: (item: T) => string | number,
+  options: PageOptions = {},
+): VaultPage<T> {
+  const limit = clampPageSize(options.limit);
+  const after = options.cursor ? decodeCursor(options.cursor) : null;
+  const start = after === null ? 0 : items.findIndex((it) => String(keyOf(it)) === after) + 1;
+  const slice = items.slice(start, start + limit);
+  const last = slice[slice.length - 1];
+  const hasMore = start + limit < items.length;
+  return {
+    items: slice,
+    nextCursor: hasMore && last !== undefined ? encodeCursor(keyOf(last)) : null,
+    cache: { cached: false, asOf: new Date().toISOString(), ttlSeconds: 0, stale: false },
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -192,50 +306,72 @@ const MOCK_VAULTS: VaultDetail[] = [
     underlying: "BTC",
     strategy: "cash_secured_put",
     apy: 0.15,
-    apyMethodology: "Trailing 12-month annualized premium income ÷ average USDC TVL. Excludes BTC spot risk — depositors are exposed to assignment at the strike price.",
-    tvl: 1850000,
-    capacity: 3000000,
-    currentStrike: 60000,
-    currentExpiry: "2026-10-17",
-    riskRating: "high",
-    description: "Writes monthly cash-secured puts on BTC. The vault holds USDC as collateral; assignment means acquiring BTC at the strike.",
-    currentEpoch: 18,
+    apyMethodology: "Trailing 12-month annualized premium income ÷ average TVL. Does not include spot price change of the underlying.",
+    tvl: 412000,
+    capacity: 750000,
+    currentStrike: 62000,
+    currentExpiry: "2026-10-03",
+    riskRating: "low",
+    description: "Sells weekly cash-secured puts on BTC. Premium is collected each epoch; the vault holds USDC as collateral.",
+    currentEpoch: 31,
     currentPhase: "active",
-    phaseEndsAt: "2026-10-17T20:00:00Z",
-    sharePrice: 1.088,
-    totalShares: 1700368,
-    feeStructure: { managementPct: 0.5, performancePct: 15 },
-    payoffExplanation: "Each month the vault sells a put option at a strike ~10% below the current BTC price, backed by USDC. If BTC stays above the strike, depositors keep the premium. If BTC falls below the strike, the vault is assigned and acquires BTC at the strike — a risk equivalent to a limit buy order.",
+    phaseEndsAt: "2026-10-03T16:00:00Z",
+    sharePrice: 1.018,
+    totalShares: 404715,
+    feeStructure: { managementPct: 0, performancePct: 10 },
+    payoffExplanation: "Each week the vault sells a put option at a strike ~10% below the current BTC price. If BTC stays above the strike, depositors keep the full premium. If BTC falls below the strike, the position is exercised and depositors take assignment of BTC at the strike price.",
     historicalEpochs: [
-      { epochNumber: 17, depositStart: "2026-08-15", activeStart: "2026-08-19", settlementDate: "2026-09-20", strike: 59000, expiryDays: 30, premiumCollected: 420, outcome: "expired_worthless", pnlPct: 0.013 },
-      { epochNumber: 16, depositStart: "2026-07-18", activeStart: "2026-07-22", settlementDate: "2026-08-16", strike: 55000, expiryDays: 30, premiumCollected: 380, outcome: "expired_worthless", pnlPct: 0.011 },
-      { epochNumber: 15, depositStart: "2026-06-21", activeStart: "2026-06-24", settlementDate: "2026-07-19", strike: 57000, expiryDays: 30, premiumCollected: 440, outcome: "expired_worthless", pnlPct: 0.014 },
+      { epochNumber: 30, depositStart: "2026-09-19", activeStart: "2026-09-20", settlementDate: "2026-09-27", strike: 61000, expiryDays: 7, premiumCollected: 0.0012, outcome: "expired_worthless", pnlPct: 0.014 },
+      { epochNumber: 29, depositStart: "2026-09-12", activeStart: "2026-09-13", settlementDate: "2026-09-20", strike: 60500, expiryDays: 7, premiumCollected: 0.0011, outcome: "expired_worthless", pnlPct: 0.012 },
     ],
     userPosition: null,
   },
-  {
-    id: "eth-ic-v1",
-    name: "ETH Iron Condor",
-    underlying: "ETH",
-    strategy: "iron_condor",
-    apy: 0.18,
-    apyMethodology: "Trailing 12-month net premium income (both spreads) ÷ average USDC collateral deployed.",
-    tvl: 620000,
-    capacity: 1000000,
-    currentStrike: 3200,
-    currentExpiry: "2026-10-10",
-    riskRating: "low",
-    description: "Sells 30-day iron condors on ETH, targeting a range-bound market. Limited loss profile; wins when ETH stays between the two breakevens.",
-    currentEpoch: 11,
-    currentPhase: "deposit",
-    phaseEndsAt: "2026-09-28T12:00:00Z",
-    sharePrice: 1.021,
-    totalShares: 607247,
-    feeStructure: { managementPct: 0, performancePct: 10 },
-    payoffExplanation: "The vault simultaneously sells an out-of-the-money call spread and a put spread on ETH. Maximum profit is the combined net premium, achieved if ETH expires between the two short strikes. Maximum loss is limited to the spread width minus the premium.",
-    historicalEpochs: [
-      { epochNumber: 10, depositStart: "2026-08-25", activeStart: "2026-08-29", settlementDate: "2026-09-28", strike: 3100, expiryDays: 30, premiumCollected: 28, outcome: "expired_worthless", pnlPct: 0.016 },
-    ],
-    userPosition: { shares: 1200, shareValue: 1.021, totalValue: 1225.2, accruedPremium: 9.6, pendingWithdrawal: 0 },
-  },
 ];
+
+// ---------------------------------------------------------------------------
+// Paginated read helpers (issue #223)
+// ---------------------------------------------------------------------------
+
+/**
+ * Fetch one page of the vault list. Sorted by vault id (stable) so cursors
+ * remain valid under concurrent registry changes.
+ */
+export async function fetchVaultsPage(options: PageOptions = {}): Promise<VaultPage<VaultSummary>> {
+  const sorted = [...MOCK_VAULTS].sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
+  return paginateByKey(sorted, (v) => v.id, options);
+}
+
+/**
+ * Fetch one page of a vault's epoch history. Sorted by epoch number descending
+ * (newest first) so a newly-closed epoch lands at the head without shifting
+ * the cursor of an in-flight pagination.
+ */
+export async function fetchEpochsPage(
+  vaultId: string,
+  options: PageOptions = {},
+): Promise<VaultPage<EpochRecord>> {
+  const id = validateVaultId(vaultId);
+  const vault = MOCK_VAULTS.find((v) => v.id === id);
+  if (!vault) {
+    throw new VaultValidationError("Vault not found");
+  }
+  const sorted = [...vault.historicalEpochs].sort((a, b) => b.epochNumber - a.epochNumber);
+  return paginateByKey(sorted, (e) => e.epochNumber, options);
+}
+
+/**
+ * Iterate every page of a paginated read, invoking `onPage` for each. Useful
+ * for "load more" / windowed-table consumers that want to accumulate rows.
+ */
+export async function iteratePages<T>(
+  fetchPage: (options: PageOptions) => Promise<VaultPage<T>>,
+  onPage: (page: VaultPage<T>) => void,
+  options: PageOptions = {},
+): Promise<void> {
+  let cursor = options.cursor ?? null;
+  do {
+    const page = await fetchPage({ ...options, cursor });
+    onPage(page);
+    cursor = page.nextCursor;
+  } while (cursor !== null);
+}
