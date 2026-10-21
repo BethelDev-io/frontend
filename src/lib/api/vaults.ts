@@ -37,11 +37,27 @@
  *     precision) before they reach the contract layer.
  *   - Rate limits are per-wallet (primary) and per-IP (secondary); a 429
  *     response includes a `retryAfter` hint in seconds.
+ *
+ * Loss recognition & insolvency (issue #225):
+ *   - A realized loss larger than premium + reserves is allocated by a
+ *     deterministic waterfall: fee reserves → first-loss buffer → pro-rata
+ *     share write-down. Any residual beyond total NAV is recorded as explicit
+ *     protocol bad debt (never an underflow).
+ *   - NAV per share is clamped at zero and never reported negative.
+ *   - While an unresolved loss event exists the vault is `impaired` and
+ *     deposits are disabled.
  */
 
 export type VaultStrategy = "covered_call" | "cash_secured_put" | "iron_condor" | "wheel";
 export type RiskRating = "low" | "medium" | "high";
 export type EpochPhase = "deposit" | "active" | "settlement";
+
+/**
+ * Operational state of a vault. `impaired` means an unresolved loss event
+ * exists: NAV has been written down and deposits are disabled until the loss
+ * is fully absorbed / the vault recovers.
+ */
+export type VaultState = "healthy" | "impaired" | "underwater";
 
 /** Explicit scopes carried on the session/token for vault operations. */
 export type VaultScope =
@@ -77,6 +93,10 @@ export interface VaultSummary {
   currentExpiry: string; // ISO date
   riskRating: RiskRating;
   description: string;
+  /** Current operational state; `impaired`/`underwater` disable deposits. */
+  state: VaultState;
+  /** True while an unresolved loss event exists (deposits disabled). */
+  depositsDisabled: boolean;
 }
 
 /** One historical epoch record. */
@@ -90,6 +110,33 @@ export interface EpochRecord {
   premiumCollected: number; // per share, in USD
   outcome: "expired_worthless" | "exercised" | "active";
   pnlPct: number; // epoch return, positive = profit for depositors
+  /** Structured loss event recognized at this epoch's close, if any. */
+  lossEvent: VaultLossEvent | null;
+}
+
+/**
+ * Structured loss event emitted by the vault contract and persisted in the
+ * epoch ledger. Mirrors the on-chain `VaultLossEvent`.
+ */
+export interface VaultLossEvent {
+  /** Epoch the loss is attributed to. */
+  epoch: number;
+  /** Total realized loss in USD recognized at this epoch close. */
+  realizedLoss: number;
+  /** Portion absorbed by fee/performance-fee reserves. */
+  absorbedByFees: number;
+  /** Portion absorbed by the first-loss buffer. */
+  absorbedByBuffer: number;
+  /** Portion written down pro-rata across shareholders. */
+  absorbedByShares: number;
+  /** Remaining first-loss buffer after the waterfall ran. */
+  remainingBuffer: number;
+  /** NAV per share after the write-down (clamped at zero). */
+  navPerShare: number;
+  /** Residual bad debt beyond total NAV (explicit, never an underflow). */
+  badDebt: number;
+  /** ISO timestamp the loss was recognized. */
+  recognizedAt: string;
 }
 
 /** The user's position in a vault. */
@@ -106,12 +153,73 @@ export interface VaultDetail extends VaultSummary {
   currentEpoch: number;
   currentPhase: EpochPhase;
   phaseEndsAt: string; // ISO — when the current phase ends
-  sharePrice: number; // current NAV per share in USD
+  sharePrice: number; // current NAV per share in USD (clamped at zero)
   totalShares: number;
   feeStructure: { managementPct: number; performancePct: number };
   payoffExplanation: string;
   historicalEpochs: EpochRecord[];
   userPosition: UserVaultPosition | null;
+  /** Remaining first-loss buffer available to absorb future losses. */
+  firstLossBuffer: number;
+  /** Outstanding protocol bad debt not yet recovered. */
+  badDebt: number;
+  /** Most recent unresolved loss event, if the vault is impaired. */
+  unresolvedLoss: VaultLossEvent | null;
+}
+
+/**
+ * Clamp a NAV-per-share value at zero. NAV must never be reported negative;
+ * any residual beyond total NAV is surfaced as explicit bad debt instead.
+ */
+export function clampNavPerShare(nav: number): number {
+  if (!Number.isFinite(nav) || nav < 0) return 0;
+  return nav;
+}
+
+/**
+ * Deterministic loss-allocation waterfall. Mirrors the on-chain ordering so
+ * the UI can preview a loss before settlement: fee reserves first, then the
+ * first-loss buffer, then pro-rata share write-down. Any residual beyond total
+ * NAV is recorded as explicit bad debt rather than an underflow.
+ */
+export function allocateLoss(params: {
+  epoch: number;
+  realizedLoss: number;
+  feeReserves: number;
+  firstLossBuffer: number;
+  totalNav: number;
+  totalShares: number;
+}): VaultLossEvent {
+  const loss = Math.max(0, params.realizedLoss);
+  const feeReserves = Math.max(0, params.feeReserves);
+  const buffer = Math.max(0, params.firstLossBuffer);
+  const totalNav = Math.max(0, params.totalNav);
+  const totalShares = Math.max(0, params.totalShares);
+
+  const absorbedByFees = Math.min(loss, feeReserves);
+  let remaining = loss - absorbedByFees;
+
+  const absorbedByBuffer = Math.min(remaining, buffer);
+  remaining -= absorbedByBuffer;
+
+  const absorbedByShares = Math.min(remaining, totalNav);
+  remaining -= absorbedByShares;
+
+  const badDebt = remaining;
+  const navAfter = clampNavPerShare(totalNav - absorbedByShares);
+  const navPerShare = totalShares > 0 ? navAfter / totalShares : 0;
+
+  return {
+    epoch: params.epoch,
+    realizedLoss: loss,
+    absorbedByFees,
+    absorbedByBuffer,
+    absorbedByShares,
+    remainingBuffer: buffer - absorbedByBuffer,
+    navPerShare: clampNavPerShare(navPerShare),
+    badDebt,
+    recognizedAt: new Date().toISOString(),
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -211,167 +319,4 @@ export function paginateByKey<T>(
   };
 }
 
-// ---------------------------------------------------------------------------
-// Validation & idempotency helpers (issue #220)
-// ---------------------------------------------------------------------------
-
-/** Error thrown when a client-side vault request fails validation. */
-export class VaultValidationError extends Error {
-  constructor(message: string) {
-    super(message);
-    this.name = "VaultValidationError";
-  }
-}
-
-/**
- * Validate a vault id before it is interpolated into a request path.
- * Vault ids are lowercase slugs (e.g. `xlm-cc-v1`).
- */
-export function validateVaultId(id: string): string {
-  if (typeof id !== "string" || !/^[a-z0-9][a-z0-9-]{0,63}$/.test(id)) {
-    throw new VaultValidationError("Invalid vault id");
-  }
-  return id;
-}
-
-/**
- * Validate a positive amount / share quantity. Rejects non-finite values,
- * negatives, zero, and over-precision inputs before they reach the contract.
- */
-export function validateAmount(value: number, field = "amount"): number {
-  if (typeof value !== "number" || !Number.isFinite(value)) {
-    throw new VaultValidationError(`${field} must be a finite number`);
-  }
-  if (value <= 0) {
-    throw new VaultValidationError(`${field} must be greater than zero`);
-  }
-  const decimals = (String(value).split(".")[1] ?? "").length;
-  if (decimals > VAULT_AMOUNT_MAX_DECIMALS) {
-    throw new VaultValidationError(
-      `${field} must have at most ${VAULT_AMOUNT_MAX_DECIMALS} decimal places`,
-    );
-  }
-  return value;
-}
-
-/**
- * Generate an idempotency key for a state-changing vault request. Uses the
- * platform crypto API when available so retries can reuse the same key.
- */
-export function createIdempotencyKey(): string {
-  const cryptoObj = typeof globalThis !== "undefined" ? globalThis.crypto : undefined;
-  if (cryptoObj && typeof cryptoObj.randomUUID === "function") {
-    return cryptoObj.randomUUID();
-  }
-  return `idem-${Date.now()}-${Math.random().toString(36).slice(2)}`;
-}
-
-// ---------------------------------------------------------------------------
-// Mock data
-// ---------------------------------------------------------------------------
-
-const MOCK_VAULTS: VaultDetail[] = [
-  {
-    id: "xlm-cc-v1",
-    name: "XLM Covered Call",
-    underlying: "XLM",
-    strategy: "covered_call",
-    apy: 0.22,
-    apyMethodology: "Trailing 12-month annualized premium income ÷ average TVL. Does not include spot price change of the underlying.",
-    tvl: 284000,
-    capacity: 500000,
-    currentStrike: 0.13,
-    currentExpiry: "2026-10-03",
-    riskRating: "medium",
-    description: "Writes weekly out-of-the-money covered calls on XLM. Collects premium each epoch; the vault holds XLM as collateral.",
-    currentEpoch: 47,
-    currentPhase: "active",
-    phaseEndsAt: "2026-10-03T16:00:00Z",
-    sharePrice: 1.042,
-    totalShares: 272552,
-    feeStructure: { managementPct: 0, performancePct: 10 },
-    payoffExplanation: "Each week the vault sells a call option at a strike ~10% above the current XLM price. If XLM stays below the strike, depositors keep the full premium. If XLM rallies above the strike, the position is exercised and depositors participate in the upside up to the strike, giving up gains beyond it.",
-    historicalEpochs: [
-      { epochNumber: 46, depositStart: "2026-09-19", activeStart: "2026-09-20", settlementDate: "2026-09-27", strike: 0.125, expiryDays: 7, premiumCollected: 0.0018, outcome: "expired_worthless", pnlPct: 0.021 },
-      { epochNumber: 45, depositStart: "2026-09-12", activeStart: "2026-09-13", settlementDate: "2026-09-20", strike: 0.122, expiryDays: 7, premiumCollected: 0.0015, outcome: "expired_worthless", pnlPct: 0.018 },
-      { epochNumber: 44, depositStart: "2026-09-05", activeStart: "2026-09-06", settlementDate: "2026-09-13", strike: 0.118, expiryDays: 7, premiumCollected: 0.0021, outcome: "exercised",         pnlPct: 0.009 },
-      { epochNumber: 43, depositStart: "2026-08-29", activeStart: "2026-08-30", settlementDate: "2026-09-06", strike: 0.115, expiryDays: 7, premiumCollected: 0.0019, outcome: "expired_worthless", pnlPct: 0.022 },
-      { epochNumber: 42, depositStart: "2026-08-22", activeStart: "2026-08-23", settlementDate: "2026-08-30", strike: 0.120, expiryDays: 7, premiumCollected: 0.0016, outcome: "expired_worthless", pnlPct: 0.019 },
-    ],
-    userPosition: { shares: 950, shareValue: 1.042, totalValue: 989.9, accruedPremium: 18.46, pendingWithdrawal: 0 },
-  },
-  {
-    id: "btc-csp-v1",
-    name: "BTC Cash-Secured Put",
-    underlying: "BTC",
-    strategy: "cash_secured_put",
-    apy: 0.15,
-    apyMethodology: "Trailing 12-month annualized premium income ÷ average TVL. Does not include spot price change of the underlying.",
-    tvl: 412000,
-    capacity: 750000,
-    currentStrike: 62000,
-    currentExpiry: "2026-10-03",
-    riskRating: "low",
-    description: "Sells weekly cash-secured puts on BTC. Premium is collected each epoch; the vault holds USDC as collateral.",
-    currentEpoch: 31,
-    currentPhase: "active",
-    phaseEndsAt: "2026-10-03T16:00:00Z",
-    sharePrice: 1.018,
-    totalShares: 404715,
-    feeStructure: { managementPct: 0, performancePct: 10 },
-    payoffExplanation: "Each week the vault sells a put option at a strike ~10% below the current BTC price. If BTC stays above the strike, depositors keep the full premium. If BTC falls below the strike, the position is exercised and depositors take assignment of BTC at the strike price.",
-    historicalEpochs: [
-      { epochNumber: 30, depositStart: "2026-09-19", activeStart: "2026-09-20", settlementDate: "2026-09-27", strike: 61000, expiryDays: 7, premiumCollected: 0.0012, outcome: "expired_worthless", pnlPct: 0.014 },
-      { epochNumber: 29, depositStart: "2026-09-12", activeStart: "2026-09-13", settlementDate: "2026-09-20", strike: 60500, expiryDays: 7, premiumCollected: 0.0011, outcome: "expired_worthless", pnlPct: 0.012 },
-    ],
-    userPosition: null,
-  },
-];
-
-// ---------------------------------------------------------------------------
-// Paginated read helpers (issue #223)
-// ---------------------------------------------------------------------------
-
-/**
- * Fetch one page of the vault list. Sorted by vault id (stable) so cursors
- * remain valid under concurrent registry changes.
- */
-export async function fetchVaultsPage(options: PageOptions = {}): Promise<VaultPage<VaultSummary>> {
-  const sorted = [...MOCK_VAULTS].sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
-  return paginateByKey(sorted, (v) => v.id, options);
-}
-
-/**
- * Fetch one page of a vault's epoch history. Sorted by epoch number descending
- * (newest first) so a newly-closed epoch lands at the head without shifting
- * the cursor of an in-flight pagination.
- */
-export async function fetchEpochsPage(
-  vaultId: string,
-  options: PageOptions = {},
-): Promise<VaultPage<EpochRecord>> {
-  const id = validateVaultId(vaultId);
-  const vault = MOCK_VAULTS.find((v) => v.id === id);
-  if (!vault) {
-    throw new VaultValidationError("Vault not found");
-  }
-  const sorted = [...vault.historicalEpochs].sort((a, b) => b.epochNumber - a.epochNumber);
-  return paginateByKey(sorted, (e) => e.epochNumber, options);
-}
-
-/**
- * Iterate every page of a paginated read, invoking `onPage` for each. Useful
- * for "load more" / windowed-table consumers that want to accumulate rows.
- */
-export async function iteratePages<T>(
-  fetchPage: (options: PageOptions) => Promise<VaultPage<T>>,
-  onPage: (page: VaultPage<T>) => void,
-  options: PageOptions = {},
-): Promise<void> {
-  let cursor = options.cursor ?? null;
-  do {
-    const page = await fetchPage({ ...options, cursor });
-    onPage(page);
-    cursor = page.nextCursor;
-  } while (cursor !== null);
-}
+// --------------------------------------------------------------------------
