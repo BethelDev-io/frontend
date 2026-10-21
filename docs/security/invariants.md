@@ -32,6 +32,7 @@ npm test src/test/security/invariants.test.ts
 | **isolation** | `isolation` | Per-wallet namespacing in `localStorage`. Alert rules, workspace layouts, and anti-phishing phrases must not bleed between wallet accounts. Hotkeys (non-sensitive) are explicitly documented as intentionally global. |
 | **headers** | `headers` | Structural HTTP and subresource security: `X-Frame-Options`, SRI hash format correctness, and the HTTPS-only policy for external resources. |
 | **vault** | `vault` | Vault share accounting: NAV source of truth, direct-transfer classification, and inflation/donation-attack mitigations (virtual offset, minimum first deposit, `minSharesOut`, NAV-jump guard). |
+| **cross-contract** | `cross-contract` | Vault cross-contract call safety: single external-call wrapper, reentrancy lock, call allowlists, and failure containment for calls to the options engine, oracle, and SEP-41 assets. |
 
 ---
 
@@ -74,6 +75,36 @@ Because `virtual_shares` and `virtual_assets` are non-zero, a donation that infl
 
 ---
 
+## Vault Cross-Contract Call Safety (Issue #291)
+
+Vaults custody depositor collateral across epochs and call out to the options engine (sale, settlement, assignment), the oracle, and SEP-41 asset contracts. A single ordering or containment bug in that call graph is a total-loss class of defect, so the following policy is enforced in code and recorded here.
+
+### Single external-call wrapper
+
+Every external call in the vault suite (core vault + strategy modules) is funneled through **one internal wrapper**. The wrapper is the only place that invokes another contract; direct cross-contract invocations elsewhere are a review-blocking defect. The wrapper enforces:
+
+1. **State-write ordering (checks-effects-interactions).** All vault accounting state (`total_book_value`, `total_shares`, per-account balances, pending epoch transition) is written **before** the external call is issued. No accounting mutation may occur after an external call returns within the same entry point.
+2. **Validated return-value handling.** Return values from the engine and oracle are treated as untrusted. Accounting state is **never** derived from an unvalidated external return value; the wrapper validates shape/range and reverts on anything unexpected rather than coercing it.
+3. **Allowlist enforcement.** The wrapper rejects any call whose target is not on the vault's explicit contract allowlist (options engine, oracle, configured SEP-41 assets). A dependency address changed by an upgrade must be re-registered through the timelocked operator path before it is callable.
+
+### Reentrancy lock
+
+An **explicit** reentrancy lock (not implicit in ordering) covers all accounting-mutating entry points: deposit, withdraw, redeem, settlement, assignment, and epoch transition. The lock is acquired on entry and released on exit; a re-entrant call into any locked entry point reverts. The vault's callback entry points additionally enforce an **explicit caller allowlist** — only the registered options engine may invoke settlement/assignment callbacks, and an auth-entry mismatch reverts.
+
+### Failure containment
+
+For each external call it is documented and enforced whether failure **aborts the transaction** (the default) or is **deferred for keeper retry**. No entry point may leave a partially applied epoch transition or a partial deposit/withdrawal: either the full state transition commits or the transaction reverts with vault state byte-identical to before the call. Calls attempted while an emergency pause is active revert. Resource-budget exhaustion mid-call reverts the whole transaction rather than leaving a half-applied transition.
+
+### Pull-based settlement
+
+Where the engine interface allows, settlement is **pull-based** (the vault reads settled results) rather than callback-driven, keeping the engine interface narrow and version-pinned. Callback-driven settlement is used only where the engine interface requires it, and only behind the caller allowlist above.
+
+### Adversarial test contracts
+
+The contract test crate includes adversarial mocks — a malicious SEP-41 token, a re-entrant options engine, an oracle returning garbage, a call that panics, and a call that exhausts the resource budget — each asserting vault state is byte-identical after any failure.
+
+---
+
 ## Invariants Table
 
 | ID | Domain | Invariant Description | Test File | Test Name | Security / WCAG Ref |
@@ -86,21 +117,6 @@ Because `virtual_shares` and `virtual_assets` are non-zero, a donation that infl
 | SEC-006 | signing | A challenge whose `URI` field is not a valid HTTPS URL must not parse (returns `null`). | `src/test/security/invariants.test.ts` | `SEC-006: challenge URI must be a valid HTTPS URL` | SIWS §4.1; OWASP Transport Layer |
 | SEC-007 | signing | A challenge with a `Version` field other than `"1"` must be rejected with `VERSION_UNSUPPORTED`. | `src/test/security/invariants.test.ts` | `SEC-007: challenge version other than '1' is rejected` | SIWS §4.5; prevents downgrade attacks |
 | SEC-008 | signing | A challenge whose `Issued At` timestamp is more than 10 minutes in the past must be rejected with `ISSUED_AT_TOO_OLD`. | `src/test/security/invariants.test.ts` | `SEC-008: challenge issued too far in the past is rejected (ISSUED_AT_TOO_OLD)` | SIWS §4.3; limits replay window |
-| SEC-009 | signing | A challenge whose `Issued At` timestamp is more than a few minutes in the future must be rejected with `ISSUED_AT_FUTURE`. | `src/test/security/invariants.test.ts` | `SEC-009: issued-at far in the future is rejected (ISSUED_AT_FUTURE)` | SIWS §4.3; prevents clock-skew abuse |
-| SEC-010 | input | An address that exactly matches a known address must not be flagged as poisoned. | `src/test/security/invariants.test.ts` | `SEC-010: exact address match is not flagged as poisoned` | CWE-20 (false-positive control) |
-| SEC-011 | input | An address that matches the first N and last N characters of a known address but differs in the middle must be flagged as poisoned. | `src/test/security/invariants.test.ts` | `SEC-011: address matching first+last chars but differing in middle is flagged` | CWE-20; address-poisoning attack pattern |
-| SEC-012 | input | A completely different address (no prefix/suffix match) must not be flagged as poisoned. | `src/test/security/invariants.test.ts` | `SEC-012: completely different address is not flagged` | CWE-20 (false-positive control) |
-| SEC-013 | input | An empty string input must not be flagged as poisoned. | `src/test/security/invariants.test.ts` | `SEC-013: empty input is not flagged` | CWE-20; null/empty input safety |
-| SEC-014 | session | After explicit logout, all `zenith.wallet.*` keys must be absent from `localStorage`. | `src/test/security/invariants.test.ts` | `SEC-014: after explicit logout, no wallet key remains in localStorage` | OWASP Session Mgmt §3.3; WCAG 2.2 SC 3.3.8 |
-| SEC-015 | session | Bearer tokens must never appear as URL query parameters (detectable by scanning constructed URLs for `token=`, `auth=`, or `bearer=`). | `src/test/security/invariants.test.ts` | `SEC-015: bearer token must not appear as a URL query parameter` | OWASP ASVS V3.4.2; tokens in URLs leak via Referer/logs |
-| SEC-016 | session | `sessionStorage` must be empty immediately after a fresh page load — wallet tokens are stored only in the zustand-persist `localStorage` store. | `src/test/security/invariants.test.ts` | `SEC-016: sessionStorage is empty after a fresh page load simulation` | OWASP Session Mgmt §2.1 |
-| SEC-017 | isolation | Alert rules must be stored under a per-wallet key (`zenith.rules.<address>`) so that switching wallets does not expose another wallet's rules. | `src/test/security/invariants.test.ts` | `SEC-017: rules are stored per wallet address and cannot bleed across wallets` | CWE-359; data isolation |
-| SEC-018 | isolation | Workspace layouts must be stored under a per-wallet key (`zenith.layout.<address>`); a different wallet must see no layout data. | `src/test/security/invariants.test.ts` | `SEC-018: workspace layouts are keyed per wallet` | CWE-359; data isolation |
-| SEC-019 | isolation | Hotkeys configuration (`zenith.hotkeys.v1`) is intentionally global (non-sensitive preference) and is explicitly documented as such, not a violation. | `src/test/security/invariants.test.ts` | `SEC-019: hotkeys config is not wallet-specific (safe global preference)` | N/A — documented exception |
-| SEC-020 | isolation | Anti-phishing phrases must be stored under a per-wallet key (`zenith.antiphishing.phrase.<address>`) and must not be visible to a different wallet. | `src/test/security/invariants.test.ts` | `SEC-020: anti-phishing phrase is wallet-scoped` | CWE-359; data isolation |
-| SEC-021 | vault | Share issuance is priced from internal book value (`total_book_value`), never from the raw token balance at the vault contract address; a direct transfer does not change NAV per share. | `src/test/security/invariants.test.ts` | `SEC-021: NAV per share is derived from book value, not raw token balance` | Issue #290; donation-attack surface |
-| SEC-022 | vault | A non-zero deposit always mints a non-zero number of shares (virtual offset + round-down guarantee), so honest depositors are never zeroed out. | `src/test/security/invariants.test.ts` | `SEC-022: non-zero deposit never mints zero shares` | Issue #290; rounding-to-zero |
-| SEC-023 | vault | An attacker round-trip (deposit → donate → withdraw) never increases the attacker's proportion of vault NAV. | `src/test/security/invariants.test.ts` | `SEC-023: attacker round-trip never increases attacker NAV proportion` | Issue #290; inflation attack |
-| SEC-024 | vault | The genesis (zero-supply) deposit below `min_first_deposit` reverts, and the first deposit's shares are minted to the dead/locked sink. | `src/test/security/invariants.test.ts` | `SEC-024: genesis deposit enforces min_first_deposit and locks initial shares` | Issue #290; first-depositor attack |
-| SEC-025 | vault | A deposit whose computed shares fall below the caller-supplied `min_shares_out` reverts. | `src/test/security/invariants.test.ts` | `SEC-025: deposit reverts when shares fall below min_shares_out` | Issue #290; quote/execution drift |
-| SEC-026 | vault | A NAV-per-share move exceeding `max_nav_jump_bps` between share-issuance events in the same ledger reverts the issuance. | `src/test/security/invariants.test.ts` | `SEC-026: NAV jump beyond max_nav_jump_bps reverts issuance` | Issue #290; NAV-jump guard |
+| SEC-009 | signing | A challenge whose `Issued At` 
+
+/* … truncated 5126 chars — edit only what you need near the top … */
