@@ -13,6 +13,7 @@ import {
   type VaultDetail,
   type EpochPhase,
 } from "../../../../lib/api/vaults";
+import { VaultAuditLog } from "../../../../components/VaultAuditLog";
 
 const PHASE_LABELS: Record<EpochPhase, string> = {
   deposit:    "Deposit Window",
@@ -444,6 +445,13 @@ export default function VaultDetailPage({ params }: { params: Promise<{ id: stri
                   assignment risk. Past returns do not guarantee future results.
                 </div>
               </div>
+            </div>
+          )}
+
+          {/* Audit Log panel (issue #243) */}
+          {vault && (
+            <div style={{ marginTop: 24, border: "1px solid var(--border-default)", background: "var(--bg-raised)", padding: 20 }}>
+              <VaultAuditLog vaultId={vault.id} />
             </div>
           )}
         </div>
