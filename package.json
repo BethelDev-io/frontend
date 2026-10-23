@@ -7,21 +7,24 @@
     "build": "next build",
     "start": "next start",
     "lint": "next lint",
-    "test": "vitest run"
     "test": "vitest run",
-    "test:watch": "vitest"
+    "test:watch": "vitest",
+    "perf": "playwright test --config=playwright.perf.config.ts",
+    "perf:vault": "playwright test --config=playwright.perf.config.ts e2e/perf/vault-epoch-perf.spec.ts",
+    "load-test:steady": "k6 run load-tests/k6/vault-read-steady.js",
+    "load-test:spike": "k6 run load-tests/k6/vault-epoch-spike.js",
+    "load-test:ci": "k6 run --out json=load-tests/results/ci-run.json load-tests/k6/vault-epoch-spike.js"
   },
   "dependencies": {
     "@dnd-kit/core": "^6.3.1",
     "@dnd-kit/sortable": "^10.0.0",
     "@dnd-kit/utilities": "^3.2.2",
     "@stellar/freighter-api": "^2.0.0",
+    "@stellar/stellar-sdk": "^17.1.0",
     "idb-keyval": "^6.3.0",
     "next": "14.2.3",
     "react": "^18",
     "react-dom": "^18",
-    "@stellar/freighter-api": "^2.0.0",
-    "@stellar/stellar-sdk": "^17.1.0",
     "zustand": "^4.5.2"
   },
   "devDependencies": {
@@ -36,7 +39,6 @@
     "autoprefixer": "^10",
     "eslint": "^8",
     "eslint-config-next": "14.2.3",
-    "vitest": "^2.1.8"
     "fake-indexeddb": "^6.2.5",
     "jsdom": "^25.0.1",
     "msw": "^2.15.0",
