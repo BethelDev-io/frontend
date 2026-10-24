@@ -45,6 +45,9 @@ import { submitTransactionXdr } from "./stellar";
  *   GET /api/v1/vaults/{id}/epochs?cursor=<opaque>&limit=<n>
  *   → { items: EpochRecord[]; nextCursor: string | null; cache: CacheMeta }
  *
+ *   GET /api/v1/vaults/{id}/analytics
+ *   → VaultAnalytics
+ *
  *   POST /api/v1/vaults/{id}/deposit   { amount: number, wallet_address, disclosure_version: string }  → { xdr: string }
  *     The backend builds the unsigned deposit transaction (amounts, NAV and
  *     caps are computed server-side). The client only signs and submits it.
@@ -748,6 +751,4 @@ export interface UserVaultPosition {
   pendingWithdrawal: number; // shares escrowed in unprocessed withdrawal requests
 }
 
-export type WithdrawalStatus = "queued" | "processed" | "cancelled";
-
-/** One redemption request in a vault's withdrawal queue
+export type WithdrawalStatus
