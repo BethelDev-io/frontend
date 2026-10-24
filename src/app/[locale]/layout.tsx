@@ -20,6 +20,7 @@ import { CommandLayer } from "../../components/command/CommandLayer";
 import { TransactionTracker } from "../../components/TransactionTracker";
 import { FlagsProvider, resolveAllFlags } from "../../lib/flags";
 import { fetchRemoteConfig } from "../../lib/flags/fetchRemoteConfig";
+import { A11yRoot } from "../../components/a11y/A11yRoot";
 import { THEME_INIT_SCRIPT } from "../../lib/theme";
 
 const fraunces = Fraunces({
@@ -102,6 +103,7 @@ export default async function LocaleLayout({ children, params }: { children: Rea
         <script nonce={nonce ?? undefined} dangerouslySetInnerHTML={{ __html: THEME_INIT_SCRIPT }} />
         <NextIntlClientProvider locale={locale} messages={messages} timeZone="UTC">
           <FlagsProvider initialFlags={initialFlags} initialRemoteConfig={remoteConfig}>
+            <A11yRoot />
             <StoreHydrator />
             <Toaster />
             <SessionBanner />
