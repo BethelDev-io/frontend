@@ -13,7 +13,13 @@
     "perf:vault": "playwright test --config=playwright.perf.config.ts e2e/perf/vault-epoch-perf.spec.ts",
     "load-test:steady": "k6 run load-tests/k6/vault-read-steady.js",
     "load-test:spike": "k6 run load-tests/k6/vault-epoch-spike.js",
-    "load-test:ci": "k6 run --out json=load-tests/results/ci-run.json load-tests/k6/vault-epoch-spike.js"
+    "load-test:ci": "k6 run --out json=load-tests/results/ci-run.json load-tests/k6/vault-epoch-spike.js",
+    "migrate:up": "node scripts/migrate.js up",
+    "migrate:down": "node scripts/migrate.js down",
+    "migrate:status": "node scripts/migrate.js status",
+    "migrate:check": "node scripts/migrate.js check",
+    "security:bounty-scope": "node scripts/security/validate-bounty-scope.mjs",
+    "backtest:vault": "npx --yes tsx scripts/vault-backtest.ts"
   },
   "dependencies": {
     "@dnd-kit/core": "^6.3.1",
