@@ -54,12 +54,82 @@ export interface VaultRoleGrant {
   grantedAt: string;
 }
 
+// ---------------------------------------------------------------------------
+// Lifecycle state machine (see docs/vault-lifecycle.md)
+// ---------------------------------------------------------------------------
+
+export const VAULT_STATUSES = ["draft", "open", "paused", "winding_down", "closed"] as const;
+export type VaultStatus = (typeof VAULT_STATUSES)[number];
+
+/** Funds-affecting user actions gated by vault status. */
+export type VaultAction = "deposit" | "withdraw";
+
+/** Who may trigger a transition. Operator actions are governance-gated (out of scope here). */
+export type VaultActor = "operator" | "guardian" | "system";
+
+export interface VaultTransition {
+  from: VaultStatus;
+  to: VaultStatus;
+  actor: VaultActor;
+}
+
+export const VAULT_TRANSITIONS: readonly VaultTransition[] = [
+  { from: "draft", to: "open", actor: "operator" },
+  { from: "open", to: "paused", actor: "guardian" },
+  { from: "open", to: "winding_down", actor: "operator" },
+  { from: "paused", to: "open", actor: "operator" },
+  { from: "paused", to: "winding_down", actor: "operator" },
+  { from: "winding_down", to: "closed", actor: "system" },
+];
+
+export interface VaultStatusPolicy {
+  label: string;
+  permittedActions: readonly VaultAction[];
+}
+
+export const VAULT_STATUS_POLICY: Record<VaultStatus, VaultStatusPolicy> = {
+  draft:        { label: "Draft",        permittedActions: [] },
+  open:         { label: "Open",         permittedActions: ["deposit", "withdraw"] },
+  paused:       { label: "Paused",       permittedActions: [] },
+  winding_down: { label: "Winding Down", permittedActions: ["withdraw"] },
+  closed:       { label: "Closed",       permittedActions: [] },
+};
+
+/** Read-only fallback for any status this client does not know about. */
+const UNKNOWN_STATUS_POLICY: VaultStatusPolicy = { label: "Unknown", permittedActions: [] };
+
+export function isVaultStatus(status: unknown): status is VaultStatus {
+  return typeof status === "string" && (VAULT_STATUSES as readonly string[]).includes(status);
+}
+
+/** Resolves policy for a raw status string. Unknown statuses are read-only, never actionable. */
+export function vaultStatusPolicy(status: string): VaultStatusPolicy {
+  return isVaultStatus(status) ? VAULT_STATUS_POLICY[status] : UNKNOWN_STATUS_POLICY;
+}
+
+/**
+ * Applies a transition. Re-applying the current status is an idempotent no-op
+ * (`changed: false`, so no history entry is written). Illegal edges or wrong actors throw.
+ */
+export function applyVaultTransition(
+  current: VaultStatus,
+  to: VaultStatus,
+  actor: VaultActor
+): { status: VaultStatus; changed: boolean } {
+  if (current === to) return { status: current, changed: false };
+  const edge = VAULT_TRANSITIONS.find(t => t.from === current && t.to === to);
+  if (!edge) throw new Error(`Illegal vault transition: ${current} → ${to}`);
+  if (edge.actor !== actor) throw new Error(`Actor ${actor} may not move vault ${current} → ${to}`);
+  return { status: to, changed: true };
+}
+
 /** Summary shown on the /vaults listing page. */
 export interface VaultSummary {
   id: string;
   name: string;
   underlying: string;
   strategy: VaultStrategy;
+  status: VaultStatus;
   /** Trailing 12-month APY estimate (0–1, e.g. 0.18 = 18%). */
   apy: number;
   /** APY methodology note shown in tooltip. */
@@ -318,6 +388,7 @@ const MOCK_VAULTS: VaultDetail[] = [
     name: "XLM Covered Call",
     underlying: "XLM",
     strategy: "covered_call",
+    status: "open",
     apy: 0.22,
     apyMethodology: "Trailing 12-month annualized premium income ÷ average TVL. Does not include spot price change of the underlying.",
     tvl: 284000,
@@ -355,6 +426,7 @@ const MOCK_VAULTS: VaultDetail[] = [
     name: "BTC Cash-Secured Put",
     underlying: "BTC",
     strategy: "cash_secured_put",
+    status: "open",
     apy: 0.15,
     apyMethodology: "Trailing 12-month annualized premium income ÷ average USDC TVL. Excludes BTC spot risk — depositors are exposed to assignment at the strike price.",
     tvl: 1850000,
@@ -390,6 +462,7 @@ const MOCK_VAULTS: VaultDetail[] = [
     name: "ETH Iron Condor",
     underlying: "ETH",
     strategy: "iron_condor",
+    status: "open",
     apy: 0.18,
     apyMethodology: "Trailing 12-month net premium income (both spreads) ÷ average USDC collateral deployed.",
     tvl: 620000,
@@ -424,6 +497,7 @@ const MOCK_VAULTS: VaultDetail[] = [
     name: "SOL Wheel",
     underlying: "SOL",
     strategy: "wheel",
+    status: "winding_down",
     apy: 0.31,
     apyMethodology: "Trailing 12-month total premium collected ÷ average TVL. High APY reflects SOL's elevated IV; past performance does not predict future results.",
     tvl: 98000,
@@ -627,133 +701,50 @@ export async function withdrawFromVault(
 }
 
 // ---------------------------------------------------------------------------
-// Cross-strategy allocator policy (pure)
-// See docs/vault-allocator.md for the rebalancing policy semantics.
+// Event notifications
 // ---------------------------------------------------------------------------
 
-/** One child vault the allocator holds shares of. */
-export interface AllocatorChild {
+export type VaultEventType =
+  | "epoch_opened"
+  | "epoch_closed"
+  | "nav_published"
+  | "premium_collected"
+  | "assignment"
+  | "redemption_claimable"
+  | "redemption_expired"
+  | "vault_paused"
+  | "vault_unpaused"
+  | "capacity_reached"
+  | "nav_drift";
+export type VaultNotificationSeverity = "info" | "warning" | "critical";
+export type VaultNotificationChannel = "in_app" | "email" | "webhook";
+
+/** A vault event from the indexer. `eventId` is the on-chain identity used for dedupe. */
+export interface VaultEvent {
+  eventId: string;
+  type: VaultEventType;
   vaultId: string;
-  /** Target weight of allocator NAV, 0–1. */
-  targetWeight: number;
-  /** Absolute weight drift (0–1) tolerated before a rebalance is triggered. */
-  driftBand: number;
+  epoch: number;
+  occurredAt: string; // ISO
+  /** Optional numeric payload, e.g. the published NAV for `nav_published`. */
+  value?: number;
 }
 
-/** Governed, versioned target-weight configuration for an allocator. */
-export interface AllocatorPolicy {
-  /** Bumped on every governed change so past rebalances stay auditable. */
-  version: number;
-  children: AllocatorChild[];
+export interface VaultEventRoute {
+  severity: VaultNotificationSeverity;
+  channels: VaultNotificationChannel[];
+  /** Events older than this are dropped so historical backfills don't flood the feed. */
+  staleAfterMs: number;
+  /** Epoch-cadence events are not sent while the vault is paused. */
+  suppressWhenPaused: boolean;
+  /** Security-relevant events ignore quiet hours so they meet their severity SLA. */
+  bypassQuietHours: boolean;
+  /** Only depositors with a non-zero balance receive the event. */
+  requiresBalance: boolean;
 }
 
-/** Marked state of one child holding, as seen by the allocator. */
-export interface AllocatorHolding {
-  vaultId: string;
-  /** USD value of shares held, marked at the child's last published epoch NAV. */
-  value: number;
-  /** False when the child has not published NAV for its current epoch. */
-  navPublished: boolean;
-  paused: boolean;
-}
+const MINUTE_MS = 60 * 1000;
+const HOUR_MS = 60 * MINUTE_MS;
+const DAY_MS = 24 * HOUR_MS;
 
-export interface AllocatorDrift {
-  vaultId: string;
-  currentWeight: number;
-  drift: number;
-  breached: boolean;
-  /** Child can be traded now (NAV published for current epoch and not paused). */
-  tradeable: boolean;
-}
-
-export interface AllocatorNav {
-  /** Sum of marked holding values, USD. */
-  nav: number;
-  /** True when any holding is priced from a stale mark or cannot be traded. */
-  degraded: boolean;
-  untradeableVaultIds: string[];
-}
-
-const WEIGHT_SUM_TOLERANCE = 1e-9;
-
-/**
- * Returns human-readable policy errors. An empty array means the policy is valid.
- * `allocatorIds` must include every allocator vault, including the allocator being configured,
- * so that holding itself or another allocator is rejected.
- */
-export function validateAllocatorPolicy(
-  allocatorId: string,
-  policy: AllocatorPolicy,
-  allocatorIds: ReadonlySet<string>
-): string[] {
-  const errors: string[] = [];
-  if (policy.children.length === 0) errors.push("Policy must contain at least one child vault");
-
-  const seen = new Set<string>();
-  let weightSum = 0;
-  for (const child of policy.children) {
-    if (seen.has(child.vaultId)) errors.push(`Duplicate child vault: ${child.vaultId}`);
-    seen.add(child.vaultId);
-
-    if (child.vaultId === allocatorId || allocatorIds.has(child.vaultId)) {
-      errors.push(`Allocator cannot hold shares of an allocator: ${child.vaultId}`);
-    }
-    if (!(child.targetWeight >= 0 && child.targetWeight <= 1)) {
-      errors.push(`Target weight out of range for ${child.vaultId}`);
-    }
-    if (!(child.driftBand > 0 && child.driftBand <= 1)) {
-      errors.push(`Drift band out of range for ${child.vaultId}`);
-    }
-    weightSum += child.targetWeight;
-  }
-
-  if (Math.abs(weightSum - 1) > WEIGHT_SUM_TOLERANCE) {
-    errors.push(`Target weights must sum to 1, got ${weightSum}`);
-  }
-  return errors;
-}
-
-/** Marks a holding as tradeable only when its NAV is published for the current epoch and it is not paused. */
-export function isHoldingTradeable(holding: AllocatorHolding): boolean {
-  return holding.navPublished && !holding.paused;
-}
-
-/** Computes current weights and drift per child against the policy targets. */
-export function computeAllocatorDrift(
-  policy: AllocatorPolicy,
-  holdings: AllocatorHolding[]
-): AllocatorDrift[] {
-  const totalValue = holdings.reduce((sum, h) => sum + h.value, 0);
-  const byId = new Map(holdings.map(h => [h.vaultId, h]));
-
-  return policy.children.map(child => {
-    const holding = byId.get(child.vaultId);
-    const currentWeight = holding && totalValue > 0 ? holding.value / totalValue : 0;
-    const drift = currentWeight - child.targetWeight;
-    return {
-      vaultId: child.vaultId,
-      currentWeight,
-      drift,
-      breached: Math.abs(drift) > child.driftBand,
-      tradeable: holding ? isHoldingTradeable(holding) : false,
-    };
-  });
-}
-
-/**
- * Rebalance is due when any child breaches its drift band. A breach on an untradeable
- * child does not make the rebalance executable; the caller must rebalance the tradeable children only.
- */
-export function isRebalanceDue(drifts: AllocatorDrift[]): boolean {
-  return drifts.some(d => d.breached && d.tradeable);
-}
-
-/** Allocator NAV from marked child holdings. Untradeable or stale holdings flag the NAV as degraded. */
-export function computeAllocatorNav(holdings: AllocatorHolding[]): AllocatorNav {
-  const untradeableVaultIds = holdings.filter(h => !isHoldingTradeable(h)).map(h => h.vaultId);
-  return {
-    nav: holdings.reduce((sum, h) => sum + h.value, 0),
-    degraded: untradeableVaultIds.length > 0,
-    untradeableVaultIds,
-  };
-}
+const ALL_CHANNELS: VaultNotificationChannel[] = ["
