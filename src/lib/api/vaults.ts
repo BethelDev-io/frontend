@@ -54,6 +54,35 @@ import { apiGet, apiPost } from "./client";
  *     remains is returned in full. Any part already filled stays paid out.
  *   - Pause: not modeled in the mock. The intended rule is that a paused vault blocks new
  *     requests but still processes queued ones.
+ *
+ * Depositor privacy (issue #231):
+ *
+ *   GET  /api/v1/vaults/privacy/export?wallet={address}
+ *   → DepositorDataExport
+ *
+ *   POST /api/v1/vaults/privacy/deletion-request  { wallet: string; reason?: string }
+ *   → DeletionRequestReceipt
+ *
+ *   GET  /api/v1/vaults/privacy/deletion-request/{id}
+ *   → DeletionRequestReceipt
+ *
+ * Public read-only partner API (issue #233):
+ *
+ *   GET /api/public/v1/vaults?limit={n}&cursor={c}
+ *   → PublicVaultListResponse
+ *
+ *   GET /api/public/v1/vaults/{id}
+ *   → PublicVaultDetail
+ *
+ *   GET /api/public/v1/vaults/{id}/epochs?limit={n}&cursor={c}
+ *   → PublicEpochHistoryResponse
+ *
+ * The public surface is a projection over the same vault registry/epoch
+ * ledger, served from a cache independent of the authenticated read path.
+ * It never exposes per-depositor data (see `toPublicVaultSummary`).
+ *
+ * See docs/privacy/vault-data-inventory.md for the data inventory, retention
+ * windows, and the deletion/export workflow this module mirrors.
  */
 
 import { bffFetch } from "./client";
@@ -642,74 +671,147 @@ export function vaultLedgerToCsv(rows: readonly VaultLedgerRow[]): string {
 }
 
 // ---------------------------------------------------------------------------
-// Mock data
+// Public read-only partner API (issue #233)
 // ---------------------------------------------------------------------------
 
-const MOCK_VAULTS: VaultDetail[] = [
-  {
-    id: "xlm-cc-v1",
-    name: "XLM Covered Call",
-    underlying: "XLM",
-    strategy: "covered_call",
-    status: "open",
-    apy: 0.22,
-    apyMethodology: "Trailing 12-month annualized premium income ÷ average TVL. Does not include spot price change of the underlying.",
-    tvl: 284000,
-    capacity: 500000,
-    currentStrike: 0.13,
-    currentExpiry: "2026-10-03",
-    riskRating: "medium",
-    description: "Writes weekly out-of-the-money covered calls on XLM. Collects premium each epoch; the vault holds XLM as collateral.",
-    epochDays: 7,
-    maxDrawdownPct: 0.07,
-    currentEpoch: 47,
-    currentPhase: "active",
-    phaseEndsAt: "2026-10-03T16:00:00Z",
-    sharePrice: 1.042,
-    totalShares: 272552,
-    roles: [
-      { role: "operator", holder: "GXLMCC_OPERATOR_MOCK", grantedAt: "2026-01-15T00:00:00Z" },
-      { role: "guardian", holder: "GXLMCC_GUARDIAN_MOCK", grantedAt: "2026-01-15T00:00:00Z" },
-      { role: "emergency_authority", holder: "GPROTOCOL_EMERGENCY_MOCK", grantedAt: "2026-01-15T00:00:00Z" },
-    ],
-    feeStructure: { managementPct: 0, performancePct: 10 },
-    payoffExplanation: "Each week the vault sells a call option at a strike ~10% above the current XLM price. If XLM stays below the strike, depositors keep the full premium. If XLM rallies above the strike, the position is exercised and depositors participate in the upside up to the strike, giving up gains beyond it.",
-    historicalEpochs: [
-      { epochNumber: 46, depositStart: "2026-09-19", activeStart: "2026-09-20", settlementDate: "2026-09-27", strike: 0.125, expiryDays: 7, premiumCollected: 0.0018, outcome: "expired_worthless", pnlPct: 0.021 },
-      { epochNumber: 45, depositStart: "2026-09-12", activeStart: "2026-09-13", settlementDate: "2026-09-20", strike: 0.122, expiryDays: 7, premiumCollected: 0.0015, outcome: "expired_worthless", pnlPct: 0.018 },
-      { epochNumber: 44, depositStart: "2026-09-05", activeStart: "2026-09-06", settlementDate: "2026-09-13", strike: 0.118, expiryDays: 7, premiumCollected: 0.0021, outcome: "exercised",         pnlPct: 0.009 },
-      { epochNumber: 43, depositStart: "2026-08-29", activeStart: "2026-08-30", settlementDate: "2026-09-06", strike: 0.115, expiryDays: 7, premiumCollected: 0.0019, outcome: "expired_worthless", pnlPct: 0.022 },
-      { epochNumber: 42, depositStart: "2026-08-22", activeStart: "2026-08-23", settlementDate: "2026-08-30", strike: 0.120, expiryDays: 7, premiumCollected: 0.0016, outcome: "expired_worthless", pnlPct: 0.019 },
-    ],
-    userPosition: { shares: 950, shareValue: 1.042, totalValue: 989.9, accruedPremium: 18.46, pendingWithdrawal: 0 },
-  },
-  {
-    id: "btc-csp-v1",
-    name: "BTC Cash-Secured Put",
-    underlying: "BTC",
-    strategy: "cash_secured_put",
-    status: "open",
-    apy: 0.15,
-    apyMethodology: "Trailing 12-month annualized premium income ÷ average USDC TVL. Excludes BTC spot risk — depositors are exposed to assignment at the strike price.",
-    tvl: 1850000,
-    capacity: 3000000,
-    currentStrike: 60000,
-    currentExpiry: "2026-10-17",
-    riskRating: "high",
-    description: "Writes monthly cash-secured puts on BTC. The vault holds USDC as collateral; assignment means acquiring BTC at the strike.",
-    epochDays: 30,
-    maxDrawdownPct: 0.21,
-    currentEpoch: 18,
-    currentPhase: "active",
-    phaseEndsAt: "2026-10-17T20:00:00Z",
-    sharePrice: 1.088,
-    totalShares: 1700368,
-    roles: [
-      { role: "operator", holder: "GBTCCSP_OPERATOR_MOCK", grantedAt: "2026-02-01T00:00:00Z" },
-      { role: "guardian", holder: "GBTCCSP_GUARDIAN_MOCK", grantedAt: "2026-02-01T00:00:00Z" },
-      { role: "emergency_authority", holder: "GPROTOCOL_EMERGENCY_MOCK", grantedAt: "2026-02-01T00:00:00Z" },
-    ],
-    feeStructure: { managementPct: 0.5, performancePct: 15 },
-    payoffExplanation: "Each month the vault sells a put option at a strike ~10% below the current BTC price, backed by USDC. If BTC stays above the strike, depositors keep the premium. If BTC falls below the strike, the vault is assigned and acquires BTC at the strike — a risk equivalent to a limit buy order.",
-    historicalEpochs: [
-      { epochNumber: 17, depositStart: "2026-08-15", activeStart: "2026-08-19", settlementDate: "2026-09-20", strike: 
+/**
+ * Public projection of a vault summary. Contains only non-sensitive fields
+ * that are safe to expose to unauthenticated third parties. Notably it omits
+ * `userPosition` and any per-depositor data.
+ */
+export interface PublicVaultSummary {
+  id: string;
+  name: string;
+  underlying: string;
+  strategy: VaultStrategy;
+  apy: number;
+  apyMethodology: string;
+  tvl: number;
+  capacity: number;
+  currentStrike: number;
+  currentExpiry: string;
+  riskRating: RiskRating;
+  description: string;
+  /** Lifecycle status so embeds can degrade gracefully. */
+  status: "active" | "paused" | "wind_down";
+}
+
+/** Public projection of a vault detail. */
+export interface PublicVaultDetail extends PublicVaultSummary {
+  currentEpoch: number;
+  currentPhase: EpochPhase;
+  phaseEndsAt: string;
+  sharePrice: number;
+  totalShares: number;
+  feeStructure: { managementPct: number; performancePct: number };
+  payoffExplanation: string;
+}
+
+/** Public projection of one epoch record. */
+export type PublicEpochRecord = EpochRecord;
+
+/** Cursor-paginated envelope used by all public list endpoints. */
+export interface PublicPage<T> {
+  data: T[];
+  /** Opaque cursor for the next page; `null` when there are no more pages. */
+  nextCursor: string | null;
+}
+
+export type PublicVaultListResponse = PublicPage<PublicVaultSummary>;
+export type PublicEpochHistoryResponse = PublicPage<PublicEpochRecord>;
+
+/**
+ * Project an internal vault summary onto the public, non-sensitive shape.
+ * This is the single chokepoint that guarantees the public API never leaks
+ * private fields — contract tests assert the output keys match exactly.
+ */
+export function toPublicVaultSummary(
+  vault: VaultSummary,
+  status: PublicVaultSummary["status"] = "active",
+): PublicVaultSummary {
+  return {
+    id: vault.id,
+    name: vault.name,
+    underlying: vault.underlying,
+    strategy: vault.strategy,
+    apy: vault.apy,
+    apyMethodology: vault.apyMethodology,
+    tvl: vault.tvl,
+    capacity: vault.capacity,
+    currentStrike: vault.currentStrike,
+    currentExpiry: vault.currentExpiry,
+    riskRating: vault.riskRating,
+    description: vault.description,
+    status,
+  };
+}
+
+/**
+ * Project an internal vault detail onto the public shape, dropping
+ * `userPosition` and `historicalEpochs` (epochs are served by their own
+ * paginated endpoint).
+ */
+export function toPublicVaultDetail(
+  vault: VaultDetail,
+  status: PublicVaultSummary["status"] = "active",
+): PublicVaultDetail {
+  return {
+    ...toPublicVaultSummary(vault, status),
+    currentEpoch: vault.currentEpoch,
+    currentPhase: vault.currentPhase,
+    phaseEndsAt: vault.phaseEndsAt,
+    sharePrice: vault.sharePrice,
+    totalShares: vault.totalShares,
+    feeStructure: vault.feeStructure,
+    payoffExplanation: vault.payoffExplanation,
+  };
+}
+
+/**
+ * Documented caching policy for the public API. Partners may cache responses
+ * for the given TTL; the CDN serves stale-while-revalidate beyond it.
+ */
+export const PUBLIC_API_CACHE_POLICY = {
+  list: { maxAge: 60, staleWhileRevalidate: 300 },
+  detail: { maxAge: 60, staleWhileRevalidate: 300 },
+  epochs: { maxAge: 300, staleWhileRevalidate: 600 },
+} as const;
+
+/** Documented rate limits for the public API (per IP unless keyed). */
+export const PUBLIC_API_RATE_LIMITS = {
+  anonymous: { requests: 60, windowSeconds: 60 },
+  keyed: { requests: 600, windowSeconds: 60 },
+} as const;
+
+/** Default and maximum page sizes for public list endpoints. */
+export const PUBLIC_API_PAGINATION = {
+  defaultLimit: 20,
+  maxLimit: 100,
+} as const;
+
+/**
+ * Build the deep link into the app's deposit flow, preserving attribution
+ * parameters so partners get credit for referred deposits.
+ */
+export function buildDepositDeepLink(
+  vaultId: string,
+  attribution: { partner?: string; utmSource?: string; utmCampaign?: string } = {},
+  baseUrl = "https://app.zenith.finance",
+): string {
+  const params = new URLSearchParams();
+  if (attribution.partner) params.set("partner", attribution.partner);
+  if (attribution.utmSource) params.set("utm_source", attribution.utmSource);
+  if (attribution.utmCampaign) params.set("utm_campaign", attribution.utmCampaign);
+  const query = params.toString();
+  return `${baseUrl}/vaults/${encodeURIComponent(vaultId)}/deposit${query ? `?${query}` : ""}`;
+}
+
+// ---------------------------------------------------------------------------
+// Depositor privacy: data inventory, retention, deletion & export
+// ---------------------------------------------------------------------------
+
+/**
+ * Classification of a vault-related data field.
+ *
+ * - `on_chain`   — derived from immutable ledger state; cannot be deleted and
+ *                  is retained indefinitely
