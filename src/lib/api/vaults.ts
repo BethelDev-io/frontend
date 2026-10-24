@@ -53,8 +53,6 @@
 export type VaultStrategy = "covered_call" | "cash_secured_put" | "iron_condor" | "wheel";
 export type RiskRating = "low" | "medium" | "high";
 export type EpochPhase = "deposit" | "active" | "settlement";
-/** `full` is derived from TVL vs. capacity in `effectiveStatus`; the backend may also report it. */
-export type VaultStatus = "open" | "paused" | "closed_to_deposits" | "full";
 
 /**
  * Per-vault roles. Each vault is its own tenant boundary: a holder of a role
@@ -76,12 +74,82 @@ export interface VaultRoleGrant {
   grantedAt: string;
 }
 
+// ---------------------------------------------------------------------------
+// Lifecycle state machine (see docs/vault-lifecycle.md)
+// ---------------------------------------------------------------------------
+
+export const VAULT_STATUSES = ["draft", "open", "paused", "winding_down", "closed"] as const;
+export type VaultStatus = (typeof VAULT_STATUSES)[number];
+
+/** Funds-affecting user actions gated by vault status. */
+export type VaultAction = "deposit" | "withdraw";
+
+/** Who may trigger a transition. Operator actions are governance-gated (out of scope here). */
+export type VaultActor = "operator" | "guardian" | "system";
+
+export interface VaultTransition {
+  from: VaultStatus;
+  to: VaultStatus;
+  actor: VaultActor;
+}
+
+export const VAULT_TRANSITIONS: readonly VaultTransition[] = [
+  { from: "draft", to: "open", actor: "operator" },
+  { from: "open", to: "paused", actor: "guardian" },
+  { from: "open", to: "winding_down", actor: "operator" },
+  { from: "paused", to: "open", actor: "operator" },
+  { from: "paused", to: "winding_down", actor: "operator" },
+  { from: "winding_down", to: "closed", actor: "system" },
+];
+
+export interface VaultStatusPolicy {
+  label: string;
+  permittedActions: readonly VaultAction[];
+}
+
+export const VAULT_STATUS_POLICY: Record<VaultStatus, VaultStatusPolicy> = {
+  draft:        { label: "Draft",        permittedActions: [] },
+  open:         { label: "Open",         permittedActions: ["deposit", "withdraw"] },
+  paused:       { label: "Paused",       permittedActions: [] },
+  winding_down: { label: "Winding Down", permittedActions: ["withdraw"] },
+  closed:       { label: "Closed",       permittedActions: [] },
+};
+
+/** Read-only fallback for any status this client does not know about. */
+const UNKNOWN_STATUS_POLICY: VaultStatusPolicy = { label: "Unknown", permittedActions: [] };
+
+export function isVaultStatus(status: unknown): status is VaultStatus {
+  return typeof status === "string" && (VAULT_STATUSES as readonly string[]).includes(status);
+}
+
+/** Resolves policy for a raw status string. Unknown statuses are read-only, never actionable. */
+export function vaultStatusPolicy(status: string): VaultStatusPolicy {
+  return isVaultStatus(status) ? VAULT_STATUS_POLICY[status] : UNKNOWN_STATUS_POLICY;
+}
+
+/**
+ * Applies a transition. Re-applying the current status is an idempotent no-op
+ * (`changed: false`, so no history entry is written). Illegal edges or wrong actors throw.
+ */
+export function applyVaultTransition(
+  current: VaultStatus,
+  to: VaultStatus,
+  actor: VaultActor
+): { status: VaultStatus; changed: boolean } {
+  if (current === to) return { status: current, changed: false };
+  const edge = VAULT_TRANSITIONS.find(t => t.from === current && t.to === to);
+  if (!edge) throw new Error(`Illegal vault transition: ${current} → ${to}`);
+  if (edge.actor !== actor) throw new Error(`Actor ${actor} may not move vault ${current} → ${to}`);
+  return { status: to, changed: true };
+}
+
 /** Summary shown on the /vaults listing page. */
 export interface VaultSummary {
   id: string;
   name: string;
   underlying: string;
   strategy: VaultStrategy;
+  status: VaultStatus;
   /** Trailing 12-month APY estimate (0–1, e.g. 0.18 = 18%). */
   apy: number;
   /** APY methodology note shown in tooltip. */
@@ -94,7 +162,6 @@ export interface VaultSummary {
   currentExpiry: string; // ISO date
   riskRating: RiskRating;
   description: string;
-  status: VaultStatus;
   /** Epoch length (tenor) in days. */
   epochDays: number;
   /** Fees as whole percentages, e.g. performancePct: 10 = 10%. */
@@ -120,10 +187,11 @@ export const VAULT_STRATEGY_LABELS: Record<VaultStrategy, string> = {
 };
 
 export const VAULT_STATUS_LABELS: Record<VaultStatus, string> = {
-  open:               "Open",
-  paused:             "Paused",
-  closed_to_deposits: "Closed to deposits",
-  full:               "Full",
+  draft:        "Draft",
+  open:         "Open",
+  paused:       "Paused",
+  winding_down: "Winding down",
+  closed:       "Closed",
 };
 
 export const VAULT_RISK_LABELS: Record<RiskRating, string> = {
@@ -371,6 +439,7 @@ const MOCK_VAULTS: VaultDetail[] = [
     name: "XLM Covered Call",
     underlying: "XLM",
     strategy: "covered_call",
+    status: "open",
     apy: 0.22,
     apyMethodology: "Trailing 12-month annualized premium income ÷ average TVL. Does not include spot price change of the underlying.",
     tvl: 284000,
@@ -379,7 +448,6 @@ const MOCK_VAULTS: VaultDetail[] = [
     currentExpiry: "2026-10-03",
     riskRating: "medium",
     description: "Writes weekly out-of-the-money covered calls on XLM. Collects premium each epoch; the vault holds XLM as collateral.",
-    status: "open",
     epochDays: 7,
     maxDrawdownPct: 0.07,
     currentEpoch: 47,
@@ -408,6 +476,7 @@ const MOCK_VAULTS: VaultDetail[] = [
     name: "BTC Cash-Secured Put",
     underlying: "BTC",
     strategy: "cash_secured_put",
+    status: "open",
     apy: 0.15,
     apyMethodology: "Trailing 12-month annualized premium income ÷ average USDC TVL. Excludes BTC spot risk — depositors are exposed to assignment at the strike price.",
     tvl: 1850000,
@@ -416,7 +485,6 @@ const MOCK_VAULTS: VaultDetail[] = [
     currentExpiry: "2026-10-17",
     riskRating: "high",
     description: "Writes monthly cash-secured puts on BTC. The vault holds USDC as collateral; assignment means acquiring BTC at the strike.",
-    status: "open",
     epochDays: 30,
     maxDrawdownPct: 0.21,
     currentEpoch: 18,
@@ -443,6 +511,7 @@ const MOCK_VAULTS: VaultDetail[] = [
     name: "ETH Iron Condor",
     underlying: "ETH",
     strategy: "iron_condor",
+    status: "open",
     apy: 0.18,
     apyMethodology: "Trailing 12-month net premium income (both spreads) ÷ average USDC collateral deployed.",
     tvl: 620000,
@@ -451,7 +520,6 @@ const MOCK_VAULTS: VaultDetail[] = [
     currentExpiry: "2026-10-10",
     riskRating: "low",
     description: "Sells 30-day iron condors on ETH, targeting a range-bound market. Limited loss profile; wins when ETH stays between the two breakevens.",
-    status: "open",
     epochDays: 30,
     maxDrawdownPct: null,
     currentEpoch: 11,
@@ -477,6 +545,7 @@ const MOCK_VAULTS: VaultDetail[] = [
     name: "SOL Wheel",
     underlying: "SOL",
     strategy: "wheel",
+    status: "winding_down",
     apy: 0.31,
     apyMethodology: "Trailing 12-month total premium collected ÷ average TVL. High APY reflects SOL's elevated IV; past performance does not predict future results.",
     tvl: 98000,
@@ -485,7 +554,6 @@ const MOCK_VAULTS: VaultDetail[] = [
     currentExpiry: "2026-10-03",
     riskRating: "high",
     description: "Runs the wheel strategy on SOL: sells cash-secured puts until assigned, then sells covered calls until called away, capturing premium in both directions.",
-    status: "closed_to_deposits",
     epochDays: 7,
     maxDrawdownPct: null,
     currentEpoch: 28,
@@ -583,82 +651,4 @@ export function processWithdrawalQueue(vaultId: string, point: ProcessingPoint):
 
 /**
  * Current risk-disclosure version. Bump this whenever the copy under
- * `vaultDisclosure.p1`–`p5` in messages/en.json changes, so every wallet
- * re-acknowledges. Acknowledgements for older versions stay in the audit
- * trail unchanged.
- */
-export const VAULT_DISCLOSURE_VERSION = "2026-10-19.1";
-
-export type PolicyReasonCode =
-  | "DISCLOSURE_NOT_ACCEPTED"
-  | "DISCLOSURE_VERSION_STALE"
-  | "JURISDICTION_NOT_ELIGIBLE";
-
-/** Policy rejection. `code` is stable and is what the UI maps to copy. */
-export class VaultPolicyError extends Error {
-  code: PolicyReasonCode;
-
-  constructor(code: PolicyReasonCode) {
-    super(code);
-    this.name = "VaultPolicyError";
-    this.code = code;
-  }
-}
-
-/**
- * One row in the acknowledgement audit trail. Deliberately holds no personal
- * data beyond the wallet address and the self-declared jurisdiction attestation.
- */
-export interface DisclosureAcknowledgement {
-  wallet: string;
-  disclosureVersion: string;
-  /** SHA-256 (hex) of the disclosure text as rendered to the user. */
-  textHash: string;
-  jurisdictionAttested: boolean;
-  acceptedAt: string; // ISO
-}
-
-export interface AcknowledgeDisclosureInput {
-  wallet: string;
-  disclosureVersion: string;
-  textHash: string;
-  jurisdictionAttested: boolean;
-}
-
-/** SHA-256 hex digest of the disclosure text, used to fingerprint what was accepted. */
-export async function hashDisclosureText(text: string): Promise<string> {
-  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(text));
-  return Array.from(new Uint8Array(digest), b => b.toString(16).padStart(2, "0")).join("");
-}
-
-// Mock persistence standing in for the backend's append-only acknowledgement table.
-const MOCK_ACK_STORAGE_KEY = "zenith.vaults.disclosureAcks.v1";
-
-function readMockAcks(): DisclosureAcknowledgement[] {
-  if (typeof window === "undefined") return [];
-  try {
-    return JSON.parse(window.localStorage.getItem(MOCK_ACK_STORAGE_KEY) ?? "[]");
-  } catch {
-    return [];
-  }
-}
-
-function appendMockAck(ack: DisclosureAcknowledgement): void {
-  if (typeof window === "undefined") return;
-  window.localStorage.setItem(MOCK_ACK_STORAGE_KEY, JSON.stringify([...readMockAcks(), ack]));
-}
-
-/** Server-side rule: the wallet's latest acknowledgement must match the current version. */
-function assertDisclosureAccepted(wallet: string, disclosureVersion: string): void {
-  if (disclosureVersion !== VAULT_DISCLOSURE_VERSION) {
-    throw new VaultPolicyError("DISCLOSURE_VERSION_STALE");
-  }
-  const latest = readMockAcks().filter(a => a.wallet === wallet).at(-1);
-  if (!latest) throw new VaultPolicyError("DISCLOSURE_NOT_ACCEPTED");
-  if (latest.disclosureVersion !== VAULT_DISCLOSURE_VERSION) {
-    throw new VaultPolicyError("DISCLOSURE_VERSION_STALE");
-  }
-  if (!latest.jurisdictionAttested) throw new VaultPolicyError("JURISDICTION_NOT_ELIGIBLE");
-}
-
-/** Records the
+ * `vaultDisclosure.p1`–`p5` in messages
