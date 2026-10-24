@@ -23,6 +23,9 @@ import { apiGet, apiPost } from "./client";
  *   POST /api/v1/vaults/{id}/withdraw  { shares: number }  → { tx_id: string; queued: boolean; request_id: string }
  *   POST /api/v1/vaults/{id}/withdrawals/{request_id}/cancel → { returned_shares: number }
  *
+ *   GET /api/v1/vaults/positions
+ *   → VaultPositionWire[]  (one row per vault the wallet holds; `error` set when that vault failed)
+ *
  *   POST /api/v1/vaults/disclosures/acknowledge
  *     { disclosure_version, text_hash, jurisdiction_attested }  → DisclosureAcknowledgement
  *   GET  /api/v1/vaults/disclosures/me  → DisclosureAcknowledgement[]
@@ -53,9 +56,10 @@ import { apiGet, apiPost } from "./client";
  *     requests but still processes queued ones.
  */
 
+import { bffFetch } from "./client";
 import { toCsv, type CsvColumn } from "../csv";
 
-export type VaultStrategy ="covered_call" | "cash_secured_put" | "iron_condor" | "wheel";
+export type VaultStrategy = "covered_call" | "cash_secured_put" | "iron_condor" | "wheel";
 export type RiskRating = "low" | "medium" | "high";
 export type EpochPhase = "deposit" | "active" | "settlement";
 
@@ -632,6 +636,11 @@ export const VAULT_EXPORT_COLUMNS: CsvColumn<VaultLedgerRow>[] = [
   { header: "lot_method", value: r => r.lotMethod },
 ];
 
+/** Serializes ledger rows to CSV using the export schema above. */
+export function vaultLedgerToCsv(rows: readonly VaultLedgerRow[]): string {
+  return toCsv(rows, VAULT_EXPORT_COLUMNS);
+}
+
 // ---------------------------------------------------------------------------
 // Mock data
 // ---------------------------------------------------------------------------
@@ -703,5 +712,4 @@ const MOCK_VAULTS: VaultDetail[] = [
     feeStructure: { managementPct: 0.5, performancePct: 15 },
     payoffExplanation: "Each month the vault sells a put option at a strike ~10% below the current BTC price, backed by USDC. If BTC stays above the strike, depositors keep the premium. If BTC falls below the strike, the vault is assigned and acquires BTC at the strike — a risk equivalent to a limit buy order.",
     historicalEpochs: [
-      { epochNumber: 17, depositStart: "2026-08-15", activeStart: "2026-08-19", settlementDate: "2026-09-20", strike: 59000, expiryDays: 30, premiumCollected: 420, outcome: "expired_worthless", pnlPct: 0.013 },
-      { epochNumber: 16, depositStart: "2026-07-18", activeStart: "2026-07-22", settlementDate: "2026-08-16", strike: 55000, expiryDays: 30, premiumCollected: 380, outcome: "expired_worthless", p
+      { epochNumber: 17, depositStart: "2026-08-15", activeStart: "2026-08-19", settlementDate: "2026-09-20", strike: 
