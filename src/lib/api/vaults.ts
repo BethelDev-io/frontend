@@ -34,7 +34,11 @@ import { toCsv, type CsvColumn } from "../csv";
  *   POST /{id}/withdraw       { shares }                    → { tx_id, queued }
  *
  *   POST /api/v1/vaults/{id}/deposit   { amount: number; disclosure_version: string }  → { tx_id: string }
- *   POST /api/v1/vaults/{id}/withdraw  { shares: number }  → { tx_id: string; queued: boolean }
+ *   POST /api/v1/vaults/{id}/withdraw  { shares: number }  → { tx_id: string; queued: boolean; request_id: string }
+ *   POST /api/v1/vaults/{id}/withdrawals/{request_id}/cancel → { returned_shares: number }
+ *
+ *   GET /api/v1/vaults/positions
+ *   → VaultPositionWire[]  (one row per vault the wallet holds; `error` set when that vault failed)
  *
  *   POST /api/v1/vaults/disclosures/acknowledge
  *     { disclosure_version, text_hash, jurisdiction_attested }  → DisclosureAcknowledgement
@@ -43,6 +47,82 @@ import { toCsv, type CsvColumn } from "../csv";
  * Deposits are rejected server-side (403 with a PolicyReasonCode) unless the
  * wallet holds an acknowledgement for the current disclosure version. The
  * client check in the UI is advisory only.
+ *
+ * Withdrawal queue semantics (mock implements these; the live contract must match):
+ *
+ *   - Request: shares are escrowed on request. Escrowed shares stay in totalShares
+ *     (so NAV per share is unaffected by the queue) but cannot be requested again.
+ *   - Ordering: requests are served by (request epoch, then seq). Requests from an
+ *     earlier epoch are always served first. `seq` is a monotonic tie-break assigned
+ *     at request time. Unfilled requests keep their epoch, seq and requestedAt.
+ *   - Fill: each epoch cohort is valued at the processing NAV. If the remaining
+ *     liquidity covers the cohort, every request fills 100%. If it does not, every
+ *     request in that cohort fills the same pro-rata fraction, and later cohorts get
+ *     nothing this pass. `fillFraction` is recorded per request.
+ *   - Processing: a keeper calls `processWithdrawalQueue` at an epoch boundary with the
+ *     NAV per share and liquidity at that point. At most MAX_COHORTS_PER_PASS cohorts
+ *     are examined per call. Filled shares leave totalShares and the user's shares.
+ *   - Settlement NAV: a processed request pays out at the NAV passed to the keeper,
+ *     not the NAV at request time.
+ *   - Cancellation: only requests still in the queue can be cancelled. The escrow that
+ *     remains is returned in full. Any part already filled stays paid out.
+ *   - Pause: not modeled in the mock. The intended rule is that a paused vault blocks new
+ *     requests but still processes queued ones.
+ *
+ * NAV / share-price source of truth (issue #290):
+ *
+ *   Share issuance is priced from the vault's internal book value
+ *   (`bookValue`), NOT from the raw token balance held at the vault
+ *   contract address. Direct token transfers to the contract are
+ *   classified as `ignored` — they do not move NAV and cannot be used
+ *   to inflate the share price. This classification is identical across
+ *   the contract, the backend indexer/registry, and this adapter.
+ *
+ *   Inflation / donation-attack mitigations are per-vault config
+ *   (`inflationDefense`) and are changeable only through the timelocked
+ *   operator path. The adapter surfaces them so the UI can enforce the
+ *   same `minSharesOut` bound the contract enforces on deposit.
+ *
+ * Shadow mode (issue #292):
+ *
+ *   A strategy may run in `shadow` mode — the identical strategy module
+ *   and keeper path execute against live oracle/engine data, but no
+ *   option orders are submitted and no depositor collateral is
+ *   committed. Shadow state lives in its own namespace (`shadow` on the
+ *   detail payload) with its own hypothetical NAV-per-share series and
+ *   epoch record stream. It is NEVER merged into `bookValue`,
+ *   `sharePrice`, `tvl`, or `historicalEpochs`, and shadow runs are
+ *   labeled `mode: "shadow"` everywhere they surface so paper results
+ *   cannot be mistaken for realized performance.
+ *
+ * Depositor privacy (issue #231):
+ *
+ *   GET  /api/v1/vaults/privacy/export?wallet={address}
+ *   → DepositorDataExport
+ *
+ *   POST /api/v1/vaults/privacy/deletion-request  { wallet: string; reason?: string }
+ *   → DeletionRequestReceipt
+ *
+ *   GET  /api/v1/vaults/privacy/deletion-request/{id}
+ *   → DeletionRequestReceipt
+ *
+ * Public read-only partner API (issue #233):
+ *
+ *   GET /api/public/v1/vaults?limit={n}&cursor={c}
+ *   → PublicVaultListResponse
+ *
+ *   GET /api/public/v1/vaults/{id}
+ *   → PublicVaultDetail
+ *
+ *   GET /api/public/v1/vaults/{id}/epochs?limit={n}&cursor={c}
+ *   → PublicEpochHistoryResponse
+ *
+ * The public surface is a projection over the same vault registry/epoch
+ * ledger, served from a cache independent of the authenticated read path.
+ * It never exposes per-depositor data (see `toPublicVaultSummary`).
+ *
+ * See docs/privacy/vault-data-inventory.md for the data inventory, retention
+ * windows, and the deletion/export workflow this module mirrors.
  *
  * Wire format
  *   - Every amount, price, share count and ratio is a decimal string
@@ -197,6 +277,47 @@ export type VaultStrategy = z.infer<typeof VaultStrategySchema>;
 export type RiskRating = z.infer<typeof RiskRatingSchema>;
 export type EpochPhase = z.infer<typeof EpochPhaseSchema>;
 
+/**
+ * Execution mode of a vault strategy.
+ *
+ * - `live`: real capital is committed and real option orders are submitted.
+ * - `shadow`: paper trading — the same decision path runs, but no orders
+ *   are submitted and no depositor collateral is committed. Shadow state
+ *   is tracked in a separate namespace and must never be conflated with
+ *   live balances.
+ */
+export type VaultMode = "live" | "shadow";
+
+/**
+ * How a direct token transfer to the vault contract address is treated.
+ * Must match the contract and backend indexer/registry exactly.
+ *
+ * - `ignored`: transfer does not affect NAV (default; donation-resistant).
+ * - `swept`: transfer is moved to a defined sink address.
+ * - `windfall`: transfer is absorbed into book value (opt-in only).
+ */
+export type DirectTransferPolicy = "ignored" | "swept" | "windfall";
+
+/**
+ * Per-vault inflation / donation-attack defense parameters.
+ * Stored with the rest of the vault parameters and mutable only via the
+ * timelocked operator path — never hardcoded constants.
+ */
+export interface InflationDefenseConfig {
+  /** Virtual shares added to total supply in the pricing formula. */
+  virtualShares: number;
+  /** Virtual assets added to book value in the pricing formula. */
+  virtualAssets: number;
+  /** Minimum assets required for the first (genesis) deposit. */
+  minFirstDeposit: number;
+  /** Shares minted to the dead/locked address on the first deposit. */
+  deadShares: number;
+  /** Max fractional NAV-per-share move between issuance events in one ledger (0–1). */
+  navJumpGuardPct: number;
+  /** Classification of direct token transfers to the contract. */
+  directTransferPolicy: DirectTransferPolicy;
+}
+
 // ---------------------------------------------------------------------------
 // Lifecycle state machine (see docs/vault-lifecycle.md)
 // ---------------------------------------------------------------------------
@@ -292,6 +413,8 @@ export interface VaultSummary {
   name: string;
   underlying: string;
   strategy: VaultStrategy;
+  /** Execution mode; `shadow` results are paper trading, not realized. */
+  mode: VaultMode;
   status: VaultStatus;
   /** Trailing 12-month APY estimate (0–1, e.g. 0.18 = 18%). */
   apy: number;
@@ -332,11 +455,11 @@ export const VAULT_STRATEGY_LABELS: Record<VaultStrategy, string> = {
 };
 
 export const VAULT_STATUS_LABELS: Record<VaultStatus, string> = {
-  draft:              "Draft",
-  open:               "Open",
-  paused:             "Paused",
-  winding_down:       "Winding Down",
-  closed:             "Closed",
+  draft:        "Draft",
+  open:         "Open",
+  paused:       "Paused",
+  winding_down: "Winding Down",
+  closed:       "Closed",
 };
 
 export const VAULT_RISK_LABELS: Record<RiskRating, string> = {
@@ -526,7 +649,104 @@ export interface UserVaultPosition {
   shareValue: number; // current USD value per share
   totalValue: number;
   accruedPremium: number;
-  pendingWithdrawal: number; // shares queued for withdrawal at epoch end
+  pendingWithdrawal: number; // shares escrowed in unprocessed withdrawal requests
+}
+
+export type WithdrawalStatus = "queued" | "processed" | "cancelled";
+
+/** One redemption request in a vault's withdrawal queue. */
+export interface WithdrawalRequest {
+  id: string;
+  vaultId: string;
+  /** Epoch the request was made in. Earlier epochs are served first. */
+  requestEpoch: number;
+  /** Monotonic tie-break within an epoch, assigned at request time. */
+  seq: number;
+  /** ISO time of the original request. Kept when unfilled requests carry forward. */
+  requestedAt: string;
+  requestedShares: number;
+  /** Shares still escrowed and not yet redeemed. */
+  escrowedShares: number;
+  filledShares: number;
+  /** filledShares / requestedShares, 0–1. Updated on every processing pass. */
+  fillFraction: number;
+  /** USD paid out, summed over every pass at that pass's processing NAV. */
+  payoutUsd: number;
+  status: WithdrawalStatus;
+}
+
+/** State of the vault at the point where the withdrawal queue is processed. */
+export interface ProcessingPoint {
+  /** NAV per share at processing. Requests settle at this price. */
+  navPerShare: number;
+  /** USD of liquid capital available to pay out. */
+  liquidityUsd: number;
+}
+
+/**
+ * One point in a hypothetical NAV-per-share series produced by a shadow
+ * run. Kept in its own namespace so it can never be read as live NAV.
+ */
+export interface ShadowNavPoint {
+  epochNumber: number;
+  /** Hypothetical NAV per share in USD (paper trading only). */
+  navPerShare: number;
+  /** NAV per share the strategy model expected for this epoch. */
+  expectedNavPerShare: number;
+  /** ISO timestamp the shadow epoch settled. */
+  recordedAt: string;
+}
+
+/**
+ * Side-by-side comparison of a shadow run against live and expected
+ * performance. All shadow figures are paper trading and must be labeled
+ * as such in the UI.
+ */
+export interface ShadowComparison {
+  /** Latest hypothetical NAV per share from the shadow run. */
+  shadowNavPerShare: number;
+  /** Latest realized NAV per share of the live vault (null if none). */
+  liveNavPerShare: number | null;
+  /** NAV per share the strategy model expected for the latest epoch. */
+  expectedNavPerShare: number;
+  /** Shadow minus live NAV per share (null when no live history). */
+  shadowVsLiveDelta: number | null;
+  /** Shadow minus expected NAV per share. */
+  shadowVsExpectedDelta: number;
+  /** Number of complete shadow epochs recorded so far. */
+  completedEpochs: number;
+}
+
+/**
+ * Shadow (paper-trading) state for a vault strategy. Tracked in its own
+ * namespace, with its own hypothetical NAV series and epoch stream, so
+ * the registry, indexer, and this read model never conflate it with real
+ * balances.
+ */
+export interface ShadowState {
+  /** Always `shadow` — makes the paper-trading label explicit in payloads. */
+  mode: "shadow";
+  /** Hypothetical NAV-per-share series, one point per complete epoch. */
+  navSeries: ShadowNavPoint[];
+  /** Shadow epoch record stream (never merged into `historicalEpochs`). */
+  epochs: EpochRecord[];
+  /** Side-by-side comparison data for the operator console/analytics. */
+  comparison: ShadowComparison;
+}
+
+/**
+ * Promotion criteria that must be met before a shadow strategy can be
+ * moved to live allocation. Evaluated by the backend promotion gate; the
+ * adapter surfaces the thresholds so the operator console can display
+ * progress and block promotion when unmet.
+ */
+export interface PromotionCriteria {
+  /** Minimum number of complete shadow epochs required. */
+  minCompleteEpochs: number;
+  /** Max allowed |shadow − expected| NAV deviation per share (USD). */
+  maxNavDeviation: number;
+  /** Whether any invariant violations were recorded during the run. */
+  invariantViolations: number;
 }
 
 export interface QueueState {
@@ -554,278 +774,13 @@ export interface VaultDetail extends VaultSummary {
   phaseEndsAt: string; // ISO — when the current phase ends
   sharePrice: number; // current NAV per share in USD
   totalShares: number;
+  /** Internal book value backing shares (source of truth for NAV). */
+  bookValue: number;
+  feeStructure: { managementPct: number; performancePct: number };
+  /** Per-vault inflation / donation-attack defense parameters. */
+  inflationDefense: InflationDefenseConfig;
   payoffExplanation: string;
   queue: QueueState;
   fees: FeeAccrual;
   historicalEpochs: EpochRecord[];
-  userPosition: UserVaultPosition | null;
-  /** Role assignments scoped to this vault only. */
-  roles: VaultRoleGrant[];
-}
-
-export interface Page<T> {
-  items: T[];
-  nextCursor: string | null;
-}
-
-export interface PageQuery {
-  limit?: number;
-  cursor?: string | null;
-}
-
-export interface TimeRangeQuery {
-  /** Inclusive RFC 3339 lower bound. */
-  from?: string;
-  /** Inclusive RFC 3339 upper bound. */
-  to?: string;
-}
-
-export interface DepositResult {
-  tx_id: string;
-}
-
-export interface WithdrawResult {
-  tx_id: string;
-  queued: boolean;
-}
-
-// ---------------------------------------------------------------------------
-// Error taxonomy
-// ---------------------------------------------------------------------------
-
-export type VaultsErrorCode =
-  | "unauthorized"
-  | "forbidden"
-  | "not_found"
-  | "epoch_closed"
-  | "invalid_request"
-  | "unavailable"
-  | "timeout"
-  | "network"
-  | "aborted"
-  | "contract"
-  | "unexpected";
-
-const RETRYABLE_CODES: ReadonlySet<VaultsErrorCode> = new Set(["unavailable", "timeout", "network"]);
-
-/** Every error the vaults surface raises. Pages can switch on `code`. */
-export class VaultsApiError extends Error {
-  readonly retryable: boolean;
-
-  constructor(readonly code: VaultsErrorCode, readonly status: number | null, message: string) {
-    super(message);
-    this.name = "VaultsApiError";
-    this.retryable = RETRYABLE_CODES.has(code);
-  }
-}
-
-function httpError(status: number, serverMessage?: string): VaultsApiError {
-  if (status === 401) return new VaultsApiError("unauthorized", status, serverMessage ?? "Session expired — sign in again.");
-  if (status === 403) return new VaultsApiError("forbidden", status, serverMessage ?? "Vaults are not enabled for this wallet.");
-  if (status === 404) return new VaultsApiError("not_found", status, serverMessage ?? "Vault not found.");
-  if (status === 409) {
-    return new VaultsApiError(
-      "epoch_closed",
-      status,
-      serverMessage ?? "The epoch closed before your request was processed. Try again in the next deposit window."
-    );
-  }
-  if (status === 400 || status === 422) return new VaultsApiError("invalid_request", status, serverMessage ?? "Request rejected.");
-  if (status >= 500) return new VaultsApiError("unavailable", status, serverMessage ?? "Vaults service is unavailable.");
-  return new VaultsApiError("unexpected", status, serverMessage ?? `Unexpected response (${status}).`);
-}
-
-// ---------------------------------------------------------------------------
-// Client interface
-// ---------------------------------------------------------------------------
-
-export type NavHistoryQuery = PageQuery & TimeRangeQuery;
-export type EpochQuery = PageQuery & TimeRangeQuery;
-
-export interface VaultsClient {
-  listVaults(query?: PageQuery, signal?: AbortSignal): Promise<Page<VaultSummary>>;
-  getVault(id: string, signal?: AbortSignal): Promise<VaultDetail | null>;
-  getNavHistory(id: string, query?: NavHistoryQuery, signal?: AbortSignal): Promise<Page<NavPoint>>;
-  getEpochs(id: string, query?: EpochQuery, signal?: AbortSignal): Promise<Page<EpochRecord>>;
-  deposit(id: string, amount: number, signal?: AbortSignal): Promise<DepositResult>;
-  withdraw(id: string, shares: number, signal?: AbortSignal): Promise<WithdrawResult>;
-}
-
-// ---------------------------------------------------------------------------
-// Shared helpers
-// ---------------------------------------------------------------------------
-
-function clampLimit(limit: number | undefined): number {
-  return Math.min(Math.max(1, Math.floor(limit ?? DEFAULT_LIMIT)), MAX_LIMIT);
-}
-
-/**
- * Wire decimal → display number. Display-only: values converted here are
- * never sent back to the backend. Requests use toDecimalString instead.
- */
-function num(decimal: string): number {
-  return Number(decimal);
-}
-
-/** Display number → wire decimal string (7 places, Stellar precision). */
-function toDecimalString(value: number, field: string): string {
-  if (!Number.isFinite(value) || value <= 0) {
-    throw new VaultsApiError("invalid_request", null, `${field} must be a positive number`);
-  }
-  return value.toFixed(7).replace(/\.?0+$/, "");
-}
-
-function qs(params: Record<string, string | number | null | undefined>): string {
-  const search = new URLSearchParams();
-  for (const [key, value] of Object.entries(params)) {
-    if (value !== undefined && value !== null && value !== "") search.set(key, String(value));
-  }
-  const out = search.toString();
-  return out ? `?${out}` : "";
-}
-
-// ---------------------------------------------------------------------------
-// Wire → UI mapping
-// ---------------------------------------------------------------------------
-
-function toSummary(w: VaultRegistryEntryWire): VaultSummary {
-  return {
-    id: w.id,
-    name: w.name,
-    underlying: w.underlying,
-    strategy: w.strategy,
-    status: "open",
-    apy: num(w.apy),
-    apyMethodology: w.apy_methodology,
-    tvl: num(w.tvl_usd),
-    capacity: num(w.capacity_usd),
-    utilisation: num(w.utilisation),
-    currentStrike: num(w.current_strike),
-    currentExpiry: w.current_expiry,
-    riskRating: w.risk_rating,
-    description: w.description,
-    epochDays: 0,
-    feeStructure: { managementPct: 0, performancePct: 0 },
-    maxDrawdownPct: null,
-  };
-}
-
-function toEpoch(w: EpochRecordWire): EpochRecord {
-  return {
-    epochNumber: w.epoch_number,
-    depositStart: w.deposit_start,
-    activeStart: w.active_start,
-    settlementDate: w.settlement_date,
-    strike: num(w.strike),
-    expiryDays: w.expiry_days,
-    premiumCollected: num(w.premium_collected),
-    outcome: w.outcome,
-    pnlPct: num(w.pnl_ratio),
-  };
-}
-
-function toNavPoint(w: NavPointWire): NavPoint {
-  return { at: w.at, sharePrice: num(w.share_price), totalShares: num(w.total_shares) };
-}
-
-function toDetail(w: VaultDetailWire): VaultDetail {
-  return {
-    ...toSummary(w),
-    currentEpoch: w.current_epoch,
-    currentPhase: w.current_phase,
-    phaseEndsAt: w.phase_ends_at,
-    sharePrice: num(w.share_price),
-    totalShares: num(w.total_shares),
-    feeStructure: {
-      managementPct: num(w.fee_structure.management_pct),
-      performancePct: num(w.fee_structure.performance_pct),
-    },
-    payoffExplanation: w.payoff_explanation,
-    queue: {
-      depositPendingUsd: num(w.queue.deposit_pending_usd),
-      withdrawPendingShares: num(w.queue.withdraw_pending_shares),
-      settlesAt: w.queue.settles_at,
-    },
-    fees: {
-      managementAccruedUsd: num(w.fees.management_accrued_usd),
-      performanceAccruedUsd: num(w.fees.performance_accrued_usd),
-      accruedThrough: w.fees.accrued_through,
-    },
-    historicalEpochs: w.recent_epochs.map(toEpoch),
-    userPosition: w.user_position && {
-      shares: num(w.user_position.shares),
-      shareValue: num(w.user_position.share_value),
-      totalValue: num(w.user_position.total_value_usd),
-      accruedPremium: num(w.user_position.accrued_premium_usd),
-      pendingWithdrawal: num(w.user_position.pending_withdrawal_shares),
-    },
-    roles: [],
-  };
-}
-
-// ---------------------------------------------------------------------------
-// Live client
-// ---------------------------------------------------------------------------
-
-interface RequestOptions {
-  method?: "GET" | "POST";
-  body?: unknown;
-  signal?: AbortSignal;
-}
-
-/**
- * Single request path for every live call: timeout, caller abort, BFF
- * transport, status → taxonomy, and response validation at the boundary.
- */
-async function request<T>(path: string, schema: z.ZodType<T>, { method = "GET", body, signal }: RequestOptions = {}): Promise<T> {
-  if (signal?.aborted) throw new VaultsApiError("aborted", null, "Vaults request was aborted.");
-
-  const controller = new AbortController();
-  let timedOut = false;
-  const timer = setTimeout(() => {
-    timedOut = true;
-    controller.abort();
-  }, REQUEST_TIMEOUT_MS);
-  const onAbort = () => controller.abort();
-  signal?.addEventListener("abort", onAbort);
-
-  try {
-    const res = await bffFetch(path, {
-      method,
-      headers: body === undefined ? undefined : { "content-type": "application/json" },
-      body: body === undefined ? undefined : JSON.stringify(body),
-      signal: controller.signal,
-    });
-
-    if (!res.ok) {
-      const payload = (await res.json().catch(() => null)) as { error?: string } | null;
-      throw httpError(res.status, payload?.error);
-    }
-
-    const parsed = schema.safeParse(await res.json());
-    if (!parsed.success) {
-      const violation = new ContractError(path, parsed.error.issues);
-      reportContractError(violation);
-      throw new VaultsApiError("contract", res.status, violation.message);
-    }
-    return parsed.data;
-  } catch (err) {
-    if (err instanceof VaultsApiError) throw err;
-    if (signal?.aborted) throw new VaultsApiError("aborted", null, "Vaults request was aborted.");
-    if (timedOut) {
-      throw new VaultsApiError("timeout", null, `Vaults request timed out after ${REQUEST_TIMEOUT_MS / 1000}s.`);
-    }
-    if (err instanceof SyntaxError) throw new VaultsApiError("contract", null, `Invalid JSON from ${path}.`);
-    throw new VaultsApiError("network", null, "Could not reach the vaults service.");
-  } finally {
-    clearTimeout(timer);
-    signal?.removeEventListener("abort", onAbort);
-  }
-}
-
-/** Last successful value per key, for graceful degradation on retryable errors. */
-const lastKnown = new Map<string, unknown>();
-
-async function remember<T>(key: string, load: () => Promise<T>): Promise<T> {
-  try {
-    const value =
+  userPosition
