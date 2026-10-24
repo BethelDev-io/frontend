@@ -22,6 +22,7 @@ import {
   type DisclosureAcknowledgement,
   type PolicyReasonCode,
 } from "../../../../lib/api/vaults";
+import { VaultGovernancePanel } from "../../../../components/VaultGovernancePanel";
 
 const PHASE_LABELS: Record<EpochPhase, string> = {
   deposit:    "Deposit Window",
@@ -570,6 +571,13 @@ export default function VaultDetailPage({ params }: { params: Promise<{ id: stri
                   assignment risk. Past returns do not guarantee future results.
                 </div>
               </div>
+            </div>
+          )}
+
+          {/* Depositor Governance panel (issue #242) */}
+          {vault && (
+            <div style={{ marginTop: 24, border: "1px solid var(--border-default)", background: "var(--bg-raised)", padding: 20 }}>
+              <VaultGovernancePanel vaultId={vault.id} />
             </div>
           )}
         </div>
