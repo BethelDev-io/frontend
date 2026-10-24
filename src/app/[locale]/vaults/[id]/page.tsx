@@ -6,6 +6,7 @@ import { use } from "react";
 import { useTranslations } from "next-intl";
 import { AppHeader } from "../../../../components/AppHeader";
 import { WalletConnect } from "../../../../components/WalletConnect";
+import { VaultReturnProjection } from "../../../../components/VaultReturnProjection";
 import { useWalletStore } from "../../../../lib/store/wallet";
 import {
   fetchVaultDetail,
@@ -345,6 +346,8 @@ export default function VaultDetailPage({ params }: { params: Promise<{ id: stri
                     </tbody>
                   </table>
                 </div>
+
+                <VaultReturnProjection historicalEpochs={vault.historicalEpochs} />
               </div>
 
               {/* Right sidebar: user position + deposit/withdraw */}
