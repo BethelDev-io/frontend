@@ -9,6 +9,7 @@ import { WalletConnect } from "../../../../components/WalletConnect";
 import { VaultAnalyticsPanel } from "../../../../components/VaultAnalyticsPanel";
 import { VaultReturnProjection } from "../../../../components/VaultReturnProjection";
 import { useWalletStore } from "../../../../lib/store/wallet";
+import { useIdempotencyKey } from "../../../../lib/hooks/useIdempotencyKey";
 import { useFlag } from "../../../../lib/flags";
 import { downloadBlob } from "../../../../lib/csv";
 import {
@@ -63,6 +64,7 @@ export default function VaultDetailPage({ params }: { params: Promise<{ id: stri
   const token = useWalletStore(s => s.session);
   const vaultsEnabled = useFlag("vaults");
   const address = useWalletStore(s => s.address);
+  const { keyFor, complete } = useIdempotencyKey();
   const t = useTranslations("vaultDisclosure");
 
   const [vault, setVault] = useState<VaultDetail | null>(null);
@@ -157,11 +159,15 @@ export default function VaultDetailPage({ params }: { params: Promise<{ id: stri
       const result = await depositToVault(vault.id, amount, token, {
         wallet: address,
         disclosureVersion: currentAck.disclosureVersion,
+        idempotencyKey: keyFor({ vault: vault.id, amount }),
         enabled: vaultsEnabled,
       });
+      complete();
       setTxStatus("success");
       setTxMessage(`Deposit confirmed. TX: ${result.tx_id}`);
       setDepositAmount("");
+      // Reconcile the displayed position with backend truth.
+      fetchVaultDetail(id, token).then(v => v && setVault(v)).catch(() => {});
     } catch (e) {
       setTxStatus(null);
       if (e instanceof VaultPolicyError) {
@@ -597,13 +603,4 @@ export default function VaultDetailPage({ params }: { params: Promise<{ id: stri
                           Withdrawal requests are queued and processed at the end of the current epoch.
                           Shares are redeemed at the final NAV after settlement.
                         </div>
-                        <div style={{ marginBottom: 12 }}>
-                          <label style={{ fontSize: 10, color: "var(--text-lo)", display: "block", marginBottom: 4 }}>Shares to Withdraw</label>
-                          <input
-                            type="number"
-                            min={0}
-                            value={withdrawShares}
-                            onChange={e => setWithdrawShares(e.target.value)}
-                            placeholder="0.0000"
-                            style={{
-                              width: "100%", padding: "
+                        <div style={{ marginBottom:
