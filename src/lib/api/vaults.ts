@@ -23,7 +23,8 @@ import { apiGet, apiPost } from "./client";
  *   → VaultAnalytics
  *
  *   POST /api/v1/vaults/{id}/deposit   { amount: number; disclosure_version: string }  → { tx_id: string }
- *   POST /api/v1/vaults/{id}/withdraw  { shares: number }  → { tx_id: string; queued: boolean }
+ *   POST /api/v1/vaults/{id}/withdraw  { shares: number }  → { tx_id: string; queued: boolean; request_id: string }
+ *   POST /api/v1/vaults/{id}/withdrawals/{request_id}/cancel → { returned_shares: number }
  *
  *   POST /api/v1/vaults/disclosures/acknowledge
  *     { disclosure_version, text_hash, jurisdiction_attested }  → DisclosureAcknowledgement
@@ -32,6 +33,27 @@ import { apiGet, apiPost } from "./client";
  * Deposits are rejected server-side (403 with a PolicyReasonCode) unless the
  * wallet holds an acknowledgement for the current disclosure version. The
  * client check in the UI is advisory only.
+ *
+ * Withdrawal queue semantics (mock implements these; the live contract must match):
+ *
+ *   - Request: shares are escrowed on request. Escrowed shares stay in totalShares
+ *     (so NAV per share is unaffected by the queue) but cannot be requested again.
+ *   - Ordering: requests are served by (request epoch, then seq). Requests from an
+ *     earlier epoch are always served first. `seq` is a monotonic tie-break assigned
+ *     at request time. Unfilled requests keep their epoch, seq and requestedAt.
+ *   - Fill: each epoch cohort is valued at the processing NAV. If the remaining
+ *     liquidity covers the cohort, every request fills 100%. If it does not, every
+ *     request in that cohort fills the same pro-rata fraction, and later cohorts get
+ *     nothing this pass. `fillFraction` is recorded per request.
+ *   - Processing: a keeper calls `processWithdrawalQueue` at an epoch boundary with the
+ *     NAV per share and liquidity at that point. At most MAX_COHORTS_PER_PASS cohorts
+ *     are examined per call. Filled shares leave totalShares and the user's shares.
+ *   - Settlement NAV: a processed request pays out at the NAV passed to the keeper,
+ *     not the NAV at request time.
+ *   - Cancellation: only requests still in the queue can be cancelled. The escrow that
+ *     remains is returned in full. Any part already filled stays paid out.
+ *   - Pause: not modeled in the mock. The intended rule is that a paused vault blocks new
+ *     requests but still processes queued ones.
  */
 
 import { toCsv, type CsvColumn } from "../csv";
@@ -39,6 +61,26 @@ import { toCsv, type CsvColumn } from "../csv";
 export type VaultStrategy ="covered_call" | "cash_secured_put" | "iron_condor" | "wheel";
 export type RiskRating = "low" | "medium" | "high";
 export type EpochPhase = "deposit" | "active" | "settlement";
+
+/**
+ * Per-vault roles. Each vault is its own tenant boundary: a holder of a role
+ * on one vault has no implicit authority over any other vault.
+ *
+ * - depositor: may deposit and withdraw/redeem
+ * - operator: may set strategy parameters and roll epochs
+ * - guardian: may pause new deposits and new epochs only (never unpause or change parameters)
+ * - emergency_authority: protocol-level emergency authority, scoped to this vault
+ */
+export type VaultRole = "depositor" | "operator" | "guardian" | "emergency_authority";
+
+/** One role assignment on a vault. */
+export interface VaultRoleGrant {
+  role: VaultRole;
+  /** Account address of the role holder. */
+  holder: string;
+  /** ISO timestamp of when the role was granted. */
+  grantedAt: string;
+}
 
 // ---------------------------------------------------------------------------
 // Lifecycle state machine (see docs/vault-lifecycle.md)
@@ -107,26 +149,6 @@ export function applyVaultTransition(
   if (!edge) throw new Error(`Illegal vault transition: ${current} → ${to}`);
   if (edge.actor !== actor) throw new Error(`Actor ${actor} may not move vault ${current} → ${to}`);
   return { status: to, changed: true };
-}
-
-/**
- * Per-vault roles. Each vault is its own tenant boundary: a holder of a role
- * on one vault has no implicit authority over any other vault.
- *
- * - depositor: may deposit and withdraw/redeem
- * - operator: may set strategy parameters and roll epochs
- * - guardian: may pause new deposits and new epochs only (never unpause or change parameters)
- * - emergency_authority: protocol-level emergency authority, scoped to this vault
- */
-export type VaultRole = "depositor" | "operator" | "guardian" | "emergency_authority";
-
-/** One role assignment on a vault. */
-export interface VaultRoleGrant {
-  role: VaultRole;
-  /** Account address of the role holder. */
-  holder: string;
-  /** ISO timestamp of when the role was granted. */
-  grantedAt: string;
 }
 
 /** Summary shown on the /vaults listing page. */
@@ -367,7 +389,38 @@ export interface UserVaultPosition {
   shareValue: number; // current USD value per share
   totalValue: number;
   accruedPremium: number;
-  pendingWithdrawal: number; // shares queued for withdrawal at epoch end
+  pendingWithdrawal: number; // shares escrowed in unprocessed withdrawal requests
+}
+
+export type WithdrawalStatus = "queued" | "processed" | "cancelled";
+
+/** One redemption request in a vault's withdrawal queue. */
+export interface WithdrawalRequest {
+  id: string;
+  vaultId: string;
+  /** Epoch the request was made in. Earlier epochs are served first. */
+  requestEpoch: number;
+  /** Monotonic tie-break within an epoch, assigned at request time. */
+  seq: number;
+  /** ISO time of the original request. Kept when unfilled requests carry forward. */
+  requestedAt: string;
+  requestedShares: number;
+  /** Shares still escrowed and not yet redeemed. */
+  escrowedShares: number;
+  filledShares: number;
+  /** filledShares / requestedShares, 0–1. Updated on every processing pass. */
+  fillFraction: number;
+  /** USD paid out, summed over every pass at that pass's processing NAV. */
+  payoutUsd: number;
+  status: WithdrawalStatus;
+}
+
+/** State of the vault at the point where the withdrawal queue is processed. */
+export interface ProcessingPoint {
+  /** NAV per share at processing. Requests settle at this price. */
+  navPerShare: number;
+  /** USD of liquid capital available to pay out. */
+  liquidityUsd: number;
 }
 
 /** Full detail for a single vault. */
@@ -689,36 +742,4 @@ const MOCK_VAULTS: VaultDetail[] = [
     strategy: "cash_secured_put",
     status: "open",
     apy: 0.15,
-    apyMethodology: "Trailing 12-month annualized premium income ÷ average USDC TVL. Excludes BTC spot risk — depositors are exposed to assignment at the strike price.",
-    tvl: 1850000,
-    capacity: 3000000,
-    currentStrike: 60000,
-    currentExpiry: "2026-10-17",
-    riskRating: "high",
-    description: "Writes monthly cash-secured puts on BTC. The vault holds USDC as collateral; assignment means acquiring BTC at the strike.",
-    epochDays: 30,
-    maxDrawdownPct: 0.21,
-    currentEpoch: 18,
-    currentPhase: "active",
-    phaseEndsAt: "2026-10-17T20:00:00Z",
-    sharePrice: 1.088,
-    totalShares: 1700368,
-    roles: [
-      { role: "operator", holder: "GBTCCSP_OPERATOR_MOCK", grantedAt: "2026-02-01T00:00:00Z" },
-      { role: "guardian", holder: "GBTCCSP_GUARDIAN_MOCK", grantedAt: "2026-02-01T00:00:00Z" },
-      { role: "emergency_authority", holder: "GPROTOCOL_EMERGENCY_MOCK", grantedAt: "2026-02-01T00:00:00Z" },
-    ],
-    feeStructure: { managementPct: 0.5, performancePct: 15 },
-    payoffExplanation: "Each month the vault sells a put option at a strike ~10% below the current BTC price, backed by USDC. If BTC stays above the strike, depositors keep the premium. If BTC falls below the strike, the vault is assigned and acquires BTC at the strike — a risk equivalent to a limit buy order.",
-    historicalEpochs: [
-      { epochNumber: 17, depositStart: "2026-08-15", activeStart: "2026-08-19", settlementDate: "2026-09-20", strike: 59000, expiryDays: 30, premiumCollected: 420, outcome: "expired_worthless", pnlPct: 0.013 },
-      { epochNumber: 16, depositStart: "2026-07-18", activeStart: "2026-07-22", settlementDate: "2026-08-16", strike: 55000, expiryDays: 30, premiumCollected: 380, outcome: "expired_worthless", pnlPct: 0.011 },
-      { epochNumber: 15, depositStart: "2026-06-21", activeStart: "2026-06-24", settlementDate: "2026-07-19", strike: 57000, expiryDays: 30, premiumCollected: 440, outcome: "expired_worthless", pnlPct: 0.014 },
-    ],
-    userPosition: null,
-  },
-  {
-    id: "eth-ic-v1",
-    name: "ETH Iron Condor",
-    underlying: "ETH",
-    strategy: "iron_
+    apyMethodology: "Trailing 12-month annualized premium income ÷ average USDC TVL. Excludes BTC spot risk — depositors are exposed to assignment at the strike price
