@@ -363,6 +363,98 @@ export const GOVERNABLE_CONTRACTS: GovernableContract[] = [
         dangerous: true,
         dangerNote: "Treasury withdrawals move depositor-adjacent funds. This action is immutably recorded in the vault audit log.",
       },
+      // ── Issue #242: share-weighted depositor governance controls ──────────
+      {
+        name: "set_quorum_bps",
+        label: "Governance quorum",
+        summary: "Sets the minimum depositor participation required for a proposal to pass.",
+        params: [
+          {
+            name: "quorum_bps",
+            label: "Quorum",
+            type: "u32",
+            placeholder: "1000",
+            help: "Basis points of total shares that must participate. 1000 = 10%.",
+            readMethod: "governance_quorum_bps",
+            unit: "%",
+            decimals: 2,
+            display: "bps",
+            suggested: "1000",
+          },
+        ],
+      },
+      {
+        name: "set_voting_period",
+        label: "Voting period",
+        summary: "Sets the duration of the depositor voting window in seconds.",
+        params: [
+          {
+            name: "period_seconds",
+            label: "Voting period",
+            type: "u32",
+            placeholder: "259200",
+            help: "Seconds. 259200 = 3 days.",
+            readMethod: "governance_voting_period",
+            unit: "s",
+            display: "seconds",
+            suggested: "259200",
+          },
+        ],
+      },
+      {
+        name: "set_governance_timelock",
+        label: "Governance timelock",
+        summary: "Sets the delay between a successful depositor vote and on-chain execution.",
+        params: [
+          {
+            name: "delay_seconds",
+            label: "Timelock delay",
+            type: "u32",
+            placeholder: "172800",
+            help: "Seconds. 172800 = 2 days.",
+            readMethod: "governance_timelock_delay",
+            unit: "s",
+            display: "seconds",
+            suggested: "172800",
+          },
+        ],
+      },
+      {
+        name: "set_proposal_threshold",
+        label: "Proposal threshold",
+        summary: "Minimum share balance a depositor must hold to create a governance proposal.",
+        params: [
+          {
+            name: "threshold_shares",
+            label: "Threshold (shares)",
+            type: "u128",
+            placeholder: "1000",
+            help: "Raw share units. Prevents spam proposals from dust holders.",
+            readMethod: "governance_proposal_threshold",
+            display: "plain",
+            suggested: "1000",
+          },
+        ],
+      },
+      {
+        name: "set_strike_band_bps",
+        label: "Strike selection band",
+        summary: "Sets the maximum OTM distance for strike selection as basis points of spot.",
+        params: [
+          {
+            name: "band_bps",
+            label: "Strike band",
+            type: "u32",
+            placeholder: "1000",
+            help: "Basis points. 1000 = 10% OTM maximum.",
+            readMethod: "strike_band_bps",
+            unit: "bps",
+            decimals: 2,
+            display: "bps",
+            suggested: "1000",
+          },
+        ],
+      },
     ],
   },
   {
@@ -989,49 +1081,3 @@ export function buildFormFields(
  * Fallback value when a param has neither a stored value nor a suggestion.
  *
  * A bool must resolve to "false" rather than "": a <select> of true/false has
- * no empty option, so an empty value would render as "false" while still
- * encoding as a missing required argument.
- */
-function defaultForParam(param: ActionParamSpec): string {
-  return param.type === "bool" ? "false" : "";
-}
-
-/** Pre-fill a blank action with the catalog's suggested values. */
-export function defaultValuesFor(
-  contractKey: string,
-  functionName: string
-): Record<string, string> {
-  const fn = findFunction(contractKey, functionName);
-  if (!fn) return {};
-  const values: Record<string, string> = {};
-  for (const param of fn.params) {
-    const value = param.suggested !== undefined ? param.suggested : defaultForParam(param);
-    if (value !== "") values[param.name] = value;
-  }
-  return values;
-}
-
-export function describeParamError(error: ParamError): string {
-  switch (error) {
-    case "required":
-      return "This field is required.";
-    case "not_a_number":
-      return "Enter a whole number.";
-    case "out_of_range":
-      return "Value is outside the allowed range for this type.";
-    case "not_integer":
-      return "Whole numbers only.";
-    case "invalid_address":
-      return "Enter a valid Stellar account (G…) or contract (C…) address.";
-    case "invalid_contract":
-      return "Enter a valid contract (C…) address.";
-    case "invalid_symbol":
-      return "Symbols cannot contain spaces.";
-    case "too_long":
-      return "Value is too long.";
-    case "invalid_bool":
-      return "Choose true or false.";
-    case "empty_list":
-      return "Provide at least one value.";
-  }
-}
