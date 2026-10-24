@@ -31,6 +31,7 @@ import {
   type DisclosureAcknowledgement,
   type PolicyReasonCode,
 } from "../../../../lib/api/vaults";
+import { VaultAuditLog } from "../../../../components/VaultAuditLog";
 import { VaultGovernancePanel } from "../../../../components/VaultGovernancePanel";
 
 const PHASE_LABELS: Record<EpochPhase, string> = {
@@ -601,6 +602,4 @@ export default function VaultDetailPage({ params }: { params: Promise<{ id: stri
                       <div style={{ padding: 16 }}>
                         <div style={{ fontSize: 11, color: "var(--text-mid)", marginBottom: 12 }}>
                           Withdrawal requests are queued and processed at the end of the current epoch.
-                          Shares are redeemed at the final NAV after settlement.
-                        </div>
-                        <div style={{ marginBottom:
+                          Shares are redeemed at
