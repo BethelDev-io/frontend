@@ -12,7 +12,8 @@
     "migrate:up": "node scripts/migrate.js up",
     "migrate:down": "node scripts/migrate.js down",
     "migrate:status": "node scripts/migrate.js status",
-    "migrate:check": "node scripts/migrate.js check"
+    "migrate:check": "node scripts/migrate.js check",
+    "security:bounty-scope": "node scripts/security/validate-bounty-scope.mjs"
   },
   "dependencies": {
     "@dnd-kit/core": "^6.3.1",
