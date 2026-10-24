@@ -3,6 +3,9 @@ import { env } from "../../env";
 import { bffFetch } from "./client";
 import { ContractError, reportContractError } from "./contractError";
 import { toCsv, type CsvColumn } from "../csv";
+import freighterApi from "@stellar/freighter-api";
+import { apiPost, type RequestOptions } from "./client";
+import { submitTransactionXdr } from "./stellar";
 
 /**
  * Vaults REST contract — v1 (frozen).
@@ -33,7 +36,10 @@ import { toCsv, type CsvColumn } from "../csv";
  *   POST /{id}/deposit        { amount }                    → { tx_id }
  *   POST /{id}/withdraw       { shares }                    → { tx_id, queued }
  *
- *   POST /api/v1/vaults/{id}/deposit   { amount: number; disclosure_version: string }  → { tx_id: string }
+ *   POST /api/v1/vaults/{id}/deposit   { amount: number, wallet_address, disclosure_version: string }  → { xdr: string }
+ *     The backend builds the unsigned deposit transaction (amounts, NAV and
+ *     caps are computed server-side). The client only signs and submits it.
+ *     Rejections carry `code`: vault_paused | vault_at_capacity | below_minimum.
  *   POST /api/v1/vaults/{id}/withdraw  { shares: number }  → { tx_id: string; queued: boolean; request_id: string }
  *   POST /api/v1/vaults/{id}/withdrawals/{request_id}/cancel → { returned_shares: number }
  *
@@ -103,7 +109,7 @@ import { toCsv, type CsvColumn } from "../csv";
  *   POST /api/v1/vaults/privacy/deletion-request  { wallet: string; reason?: string }
  *   → DeletionRequestReceipt
  *
- *   GET  /api/v1/vaults/privacy/deletion-request/{id}
+ *   GET /api/v1/vaults/privacy/deletion-request/{id}
  *   → DeletionRequestReceipt
  *
  * Public read-only partner API (issue #233):
@@ -774,13 +780,4 @@ export interface VaultDetail extends VaultSummary {
   phaseEndsAt: string; // ISO — when the current phase ends
   sharePrice: number; // current NAV per share in USD
   totalShares: number;
-  /** Internal book value backing shares (source of truth for NAV). */
-  bookValue: number;
-  feeStructure: { managementPct: number; performancePct: number };
-  /** Per-vault inflation / donation-attack defense parameters. */
-  inflationDefense: InflationDefenseConfig;
-  payoffExplanation: string;
-  queue: QueueState;
-  fees: FeeAccrual;
-  historicalEpochs: EpochRecord[];
-  userPosition
+  /** Internal
