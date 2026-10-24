@@ -1,3 +1,9 @@
+import { z } from "zod";
+import { env } from "../../env";
+import { bffFetch } from "./client";
+import { ContractError, reportContractError } from "./contractError";
+import { toCsv, type CsvColumn } from "../csv";
+
 /**
  * Vaults REST contract — v1 (frozen).
  *
@@ -10,7 +16,8 @@
  * API is not yet available. This module is unrelated to the margin-collateral
  * vault in `./vault.ts`. When NEXT_PUBLIC_VAULTS=mock (or the env var is absent), the mock
  * implementation below is used. Swap in the real implementation by
- * setting NEXT_PUBLIC_VAULTS=live and implementing `fetchVaultsLive`.
+ * setting NEXT_PUBLIC_VAULTS=live, which calls the backend vault registry
+ * (Zenith-options/backend) through the REST contract below.
  *
  * Transport
  *   All requests go through the BFF (`bffFetch`). The bearer token lives in
@@ -73,11 +80,6 @@
  *   or "mock") selects the mock client backed by MOCK_VAULTS. Pages import only
  *   from this module, so flipping the flag needs no page changes.
  */
-
-import { z } from "zod";
-import { env } from "../../env";
-import { bffFetch } from "./client";
-import { ContractError, reportContractError } from "./contractError";
 
 export const VAULTS_API_VERSION = "v1" as const;
 const API = `/api/${VAULTS_API_VERSION}/vaults`;
@@ -194,28 +196,6 @@ const pageOf = <T extends z.ZodTypeAny>(item: T) =>
 export type VaultStrategy = z.infer<typeof VaultStrategySchema>;
 export type RiskRating = z.infer<typeof RiskRatingSchema>;
 export type EpochPhase = z.infer<typeof EpochPhaseSchema>;
-/** `full` is derived from TVL vs. capacity in `effectiveStatus`; the backend may also report it. */
-export type VaultStatus = "open" | "paused" | "closed_to_deposits" | "full";
-
-/**
- * Per-vault roles. Each vault is its own tenant boundary: a holder of a role
- * on one vault has no implicit authority over any other vault.
- *
- * - depositor: may deposit and withdraw/redeem
- * - operator: may set strategy parameters and roll epochs
- * - guardian: may pause new deposits and new epochs only (never unpause or change parameters)
- * - emergency_authority: protocol-level emergency authority, scoped to this vault
- */
-export type VaultRole = "depositor" | "operator" | "guardian" | "emergency_authority";
-
-/** One role assignment on a vault. */
-export interface VaultRoleGrant {
-  role: VaultRole;
-  /** Account address of the role holder. */
-  holder: string;
-  /** ISO timestamp of when the role was granted. */
-  grantedAt: string;
-}
 
 // ---------------------------------------------------------------------------
 // Lifecycle state machine (see docs/vault-lifecycle.md)
@@ -286,6 +266,26 @@ export function applyVaultTransition(
   return { status: to, changed: true };
 }
 
+/**
+ * Per-vault roles. Each vault is its own tenant boundary: a holder of a role
+ * on one vault has no implicit authority over any other vault.
+ *
+ * - depositor: may deposit and withdraw/redeem
+ * - operator: may set strategy parameters and roll epochs
+ * - guardian: may pause new deposits and new epochs only (never unpause or change parameters)
+ * - emergency_authority: protocol-level emergency authority, scoped to this vault
+ */
+export type VaultRole = "depositor" | "operator" | "guardian" | "emergency_authority";
+
+/** One role assignment on a vault. */
+export interface VaultRoleGrant {
+  role: VaultRole;
+  /** Account address of the role holder. */
+  holder: string;
+  /** ISO timestamp of when the role was granted. */
+  grantedAt: string;
+}
+
 /** Summary shown on the /vaults listing page. */
 export interface VaultSummary {
   id: string;
@@ -307,7 +307,6 @@ export interface VaultSummary {
   currentExpiry: string; // ISO date
   riskRating: RiskRating;
   description: string;
-  status: VaultStatus;
   /** Epoch length (tenor) in days. */
   epochDays: number;
   /** Fees as whole percentages, e.g. performancePct: 10 = 10%. */
@@ -333,10 +332,11 @@ export const VAULT_STRATEGY_LABELS: Record<VaultStrategy, string> = {
 };
 
 export const VAULT_STATUS_LABELS: Record<VaultStatus, string> = {
+  draft:              "Draft",
   open:               "Open",
   paused:             "Paused",
-  closed_to_deposits: "Closed to deposits",
-  full:               "Full",
+  winding_down:       "Winding Down",
+  closed:             "Closed",
 };
 
 export const VAULT_RISK_LABELS: Record<RiskRating, string> = {
@@ -694,6 +694,7 @@ function toSummary(w: VaultRegistryEntryWire): VaultSummary {
     name: w.name,
     underlying: w.underlying,
     strategy: w.strategy,
+    status: "open",
     apy: num(w.apy),
     apyMethodology: w.apy_methodology,
     tvl: num(w.tvl_usd),
@@ -703,6 +704,9 @@ function toSummary(w: VaultRegistryEntryWire): VaultSummary {
     currentExpiry: w.current_expiry,
     riskRating: w.risk_rating,
     description: w.description,
+    epochDays: 0,
+    feeStructure: { managementPct: 0, performancePct: 0 },
+    maxDrawdownPct: null,
   };
 }
 
@@ -755,6 +759,7 @@ function toDetail(w: VaultDetailWire): VaultDetail {
       accruedPremium: num(w.user_position.accrued_premium_usd),
       pendingWithdrawal: num(w.user_position.pending_withdrawal_shares),
     },
+    roles: [],
   };
 }
 
@@ -823,7 +828,4 @@ const lastKnown = new Map<string, unknown>();
 
 async function remember<T>(key: string, load: () => Promise<T>): Promise<T> {
   try {
-    const value = await load();
-    lastKnown.set(key, value);
-    return value;
-  } catch (
+    const value =
