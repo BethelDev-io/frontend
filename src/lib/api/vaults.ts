@@ -59,12 +59,82 @@ export interface VaultRoleGrant {
   grantedAt: string;
 }
 
+// ---------------------------------------------------------------------------
+// Lifecycle state machine (see docs/vault-lifecycle.md)
+// ---------------------------------------------------------------------------
+
+export const VAULT_STATUSES = ["draft", "open", "paused", "winding_down", "closed"] as const;
+export type VaultStatus = (typeof VAULT_STATUSES)[number];
+
+/** Funds-affecting user actions gated by vault status. */
+export type VaultAction = "deposit" | "withdraw";
+
+/** Who may trigger a transition. Operator actions are governance-gated (out of scope here). */
+export type VaultActor = "operator" | "guardian" | "system";
+
+export interface VaultTransition {
+  from: VaultStatus;
+  to: VaultStatus;
+  actor: VaultActor;
+}
+
+export const VAULT_TRANSITIONS: readonly VaultTransition[] = [
+  { from: "draft", to: "open", actor: "operator" },
+  { from: "open", to: "paused", actor: "guardian" },
+  { from: "open", to: "winding_down", actor: "operator" },
+  { from: "paused", to: "open", actor: "operator" },
+  { from: "paused", to: "winding_down", actor: "operator" },
+  { from: "winding_down", to: "closed", actor: "system" },
+];
+
+export interface VaultStatusPolicy {
+  label: string;
+  permittedActions: readonly VaultAction[];
+}
+
+export const VAULT_STATUS_POLICY: Record<VaultStatus, VaultStatusPolicy> = {
+  draft:        { label: "Draft",        permittedActions: [] },
+  open:         { label: "Open",         permittedActions: ["deposit", "withdraw"] },
+  paused:       { label: "Paused",       permittedActions: [] },
+  winding_down: { label: "Winding Down", permittedActions: ["withdraw"] },
+  closed:       { label: "Closed",       permittedActions: [] },
+};
+
+/** Read-only fallback for any status this client does not know about. */
+const UNKNOWN_STATUS_POLICY: VaultStatusPolicy = { label: "Unknown", permittedActions: [] };
+
+export function isVaultStatus(status: unknown): status is VaultStatus {
+  return typeof status === "string" && (VAULT_STATUSES as readonly string[]).includes(status);
+}
+
+/** Resolves policy for a raw status string. Unknown statuses are read-only, never actionable. */
+export function vaultStatusPolicy(status: string): VaultStatusPolicy {
+  return isVaultStatus(status) ? VAULT_STATUS_POLICY[status] : UNKNOWN_STATUS_POLICY;
+}
+
+/**
+ * Applies a transition. Re-applying the current status is an idempotent no-op
+ * (`changed: false`, so no history entry is written). Illegal edges or wrong actors throw.
+ */
+export function applyVaultTransition(
+  current: VaultStatus,
+  to: VaultStatus,
+  actor: VaultActor
+): { status: VaultStatus; changed: boolean } {
+  if (current === to) return { status: current, changed: false };
+  const edge = VAULT_TRANSITIONS.find(t => t.from === current && t.to === to);
+  if (!edge) throw new Error(`Illegal vault transition: ${current} → ${to}`);
+  if (edge.actor !== actor) throw new Error(`Actor ${actor} may not move vault ${current} → ${to}`);
+  return { status: to, changed: true };
+}
+
 /** Summary shown on the /vaults listing page. */
 export interface VaultSummary {
   id: string;
   name: string;
   underlying: string;
   strategy: VaultStrategy;
+  status: VaultStatus;
   /** Trailing 12-month APY estimate (0–1, e.g. 0.18 = 18%). */
   apy: number;
   /** APY methodology note shown in tooltip. */
@@ -323,6 +393,7 @@ const MOCK_VAULTS: VaultDetail[] = [
     name: "XLM Covered Call",
     underlying: "XLM",
     strategy: "covered_call",
+    status: "open",
     apy: 0.22,
     apyMethodology: "Trailing 12-month annualized premium income ÷ average TVL. Does not include spot price change of the underlying.",
     tvl: 284000,
@@ -360,6 +431,7 @@ const MOCK_VAULTS: VaultDetail[] = [
     name: "BTC Cash-Secured Put",
     underlying: "BTC",
     strategy: "cash_secured_put",
+    status: "open",
     apy: 0.15,
     apyMethodology: "Trailing 12-month annualized premium income ÷ average USDC TVL. Excludes BTC spot risk — depositors are exposed to assignment at the strike price.",
     tvl: 1850000,
@@ -395,6 +467,7 @@ const MOCK_VAULTS: VaultDetail[] = [
     name: "ETH Iron Condor",
     underlying: "ETH",
     strategy: "iron_condor",
+    status: "open",
     apy: 0.18,
     apyMethodology: "Trailing 12-month net premium income (both spreads) ÷ average USDC collateral deployed.",
     tvl: 620000,
@@ -429,6 +502,7 @@ const MOCK_VAULTS: VaultDetail[] = [
     name: "SOL Wheel",
     underlying: "SOL",
     strategy: "wheel",
+    status: "winding_down",
     apy: 0.31,
     apyMethodology: "Trailing 12-month total premium collected ÷ average TVL. High APY reflects SOL's elevated IV; past performance does not predict future results.",
     tvl: 98000,
@@ -594,95 +668,4 @@ export async function fetchVaults(): Promise<VaultSummary[]> {
 }
 
 export async function fetchVaultDetail(id: string, _token?: string | null): Promise<VaultDetail | null> {
-  if (process.env.NEXT_PUBLIC_VAULTS === "live") {
-    // TODO: return apiGet<VaultDetail>(`/api/v1/vaults/${id}`, token);
-    throw new Error("Live vaults API not yet implemented");
-  }
-  return Promise.resolve(MOCK_VAULTS.find(v => v.id === id) ?? null);
-}
-
-// ---------------------------------------------------------------------------
-// Wallet vault positions (portfolio / account surfaces)
-// ---------------------------------------------------------------------------
-
-/** NAV older than this is flagged as stale instead of being presented as current. */
-export const NAV_STALE_AFTER_MS = 15 * 60 * 1000;
-
-/** Wire shape of one vault position from GET /api/v1/vaults/positions. */
-export interface VaultPositionWire {
-  vault_id: string;
-  name: string;
-  strategy: VaultStrategy;
-  /** Shares held, including any queued for redemption. */
-  shares: number;
-  pending_withdrawal_shares: number;
-  /** USD deposits queued for the next epoch, not yet minted into shares. */
-  pending_deposit_usd: number;
-  nav_per_share: number;
-  /** Total USD paid in for all shares held. */
-  cost_basis_usd: number;
-  nav_as_of: string; // ISO
-  /** Set instead of the position fields when this vault's data failed to load. */
-  error?: string;
-}
-
-/** A wallet's position in one vault, normalised for display and aggregation. */
-export interface VaultPositionRow {
-  vaultId: string;
-  name: string;
-  strategy: VaultStrategy;
-  /** Settled shares only — queued redemptions are excluded. */
-  shares: number;
-  navPerShare: number;
-  /** Settled shares × NAV per share. */
-  currentValue: number;
-  /** Cost basis of the settled shares. */
-  costBasis: number;
-  unrealisedPnl: number;
-  /** Queued redemptions (at NAV) plus queued deposits, shown as pending. */
-  pendingValue: number;
-  navAsOf: string; // ISO
-  navStale: boolean;
-}
-
-export interface VaultPositionFailure {
-  vaultId: string;
-  name: string;
-  message: string;
-}
-
-export interface VaultPositionsResult {
-  rows: VaultPositionRow[];
-  /** Vaults whose data failed to load. They are excluded from every total. */
-  failed: VaultPositionFailure[];
-}
-
-export interface VaultPortfolioTotals {
-  currentValue: number;
-  pendingValue: number;
-  costBasis: number;
-  unrealisedPnl: number;
-  staleCount: number;
-}
-
-function toPositionRow(w: VaultPositionWire, now: number): VaultPositionRow {
-  const settledShares = Math.max(0, w.shares - w.pending_withdrawal_shares);
-  const currentValue = settledShares * w.nav_per_share;
-  const costBasis = w.shares > 0 ? (w.cost_basis_usd * settledShares) / w.shares : 0;
-  return {
-    vaultId: w.vault_id,
-    name: w.name,
-    strategy: w.strategy,
-    shares: settledShares,
-    navPerShare: w.nav_per_share,
-    currentValue,
-    costBasis,
-    unrealisedPnl: currentValue - costBasis,
-    pendingValue: w.pending_withdrawal_shares * w.nav_per_share + w.pending_deposit_usd,
-    navAsOf: w.nav_as_of,
-    navStale: now - Date.parse(w.nav_as_of) > NAV_STALE_AFTER_MS,
-  };
-}
-
-/**
- * Wallet vault positions. Live reads the
+  if (process.env.NEXT_PUBLIC_
