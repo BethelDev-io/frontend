@@ -22,7 +22,10 @@ import { apiGet, apiPost } from "./client";
  *   GET /api/v1/vaults/{id}/epochs?cursor=<opaque>&limit=<n>
  *   → { items: EpochRecord[]; nextCursor: string | null; cache: CacheMeta }
  *
- *   POST /api/v1/vaults/{id}/deposit   { amount: number; disclosure_version: string }  → { tx_id: string }
+ *   POST /api/v1/vaults/{id}/deposit   { amount: number, wallet_address, disclosure_version: string }  → { xdr: string }
+ *     The backend builds the unsigned deposit transaction (amounts, NAV and
+ *     caps are computed server-side). The client only signs and submits it.
+ *     Rejections carry `code`: vault_paused | vault_at_capacity | below_minimum.
  *   POST /api/v1/vaults/{id}/withdraw  { shares: number }  → { tx_id: string; queued: boolean; request_id: string }
  *   POST /api/v1/vaults/{id}/withdrawals/{request_id}/cancel → { returned_shares: number }
  *
@@ -141,6 +144,9 @@ import { apiGet, apiPost } from "./client";
  * windows, and the deletion/export workflow this module mirrors.
  */
 
+import freighterApi from "@stellar/freighter-api";
+import { apiPost, type RequestOptions } from "./client";
+import { submitTransactionXdr } from "./stellar";
 import { bffFetch } from "./client";
 import { toCsv, type CsvColumn } from "../csv";
 
@@ -790,14 +796,4 @@ export interface VaultPage<T> {
 /** Options accepted by the paginated read helpers. */
 export interface PageOptions {
   /** Opaque cursor returned by a previous page. Omit for the first page. */
-  cursor?: string | null;
-  /** Requested page size; clamped to [1, VAULT_MAX_PAGE_SIZE]. */
-  limit?: number;
-}
-
-/**
- * Clamp a requested page size into the documented bounds. Exported so the BFF
- * route handlers apply the exact same cap as the client.
- */
-export function clampPageSize(limit?: number): number {
-  if (limit === undefined || limit === null || !Number.isFinite(limit)) {
+  cursor?: string |
