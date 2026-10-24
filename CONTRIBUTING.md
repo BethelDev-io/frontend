@@ -6,11 +6,23 @@ pipeline, and branch protection setup.
 ## Contents
 
 - [Getting started](#getting-started)
+- [Security researchers & bug bounty program](#security-researchers--bug-bounty-program)
 - [Development workflow](#development-workflow)
 - [CI pipeline](#ci-pipeline)
 - [Bundle budgets](#bundle-budgets)
 - [Branch protection setup](#branch-protection-setup)
 - [TypeScript strictness](#typescript-strictness)
+
+---
+
+## Security researchers & bug bounty program
+
+If you have discovered a security vulnerability or potential defect affecting vault custody, smart contracts, backend APIs, or client signing surfaces:
+
+- **DO NOT open public GitHub issues or pull requests.**
+- Submit your finding confidentially via a **GitHub Private Security Advisory** on this repository or email encrypted reports to `security@zenith-options.org`.
+- Zenith maintains an active, public **Bug Bounty Program** with rewards up to **$25,000 USD / USDC** and full **Safe Harbour** protection for good-faith researchers.
+- Read the complete scope, asset inventory, and triage SLAs in [`docs/security/bug-bounty-program.md`](docs/security/bug-bounty-program.md) and [`SECURITY.md`](SECURITY.md).
 
 ---
 
