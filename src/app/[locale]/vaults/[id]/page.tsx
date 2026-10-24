@@ -9,10 +9,12 @@ import { WalletConnect } from "../../../../components/WalletConnect";
 import { VaultReturnProjection } from "../../../../components/VaultReturnProjection";
 import { useWalletStore } from "../../../../lib/store/wallet";
 import { useIdempotencyKey } from "../../../../lib/hooks/useIdempotencyKey";
+import { downloadBlob } from "../../../../lib/csv";
 import {
   fetchVaultDetail,
   depositToVault,
   withdrawFromVault,
+  fetchVaultExport,
   vaultStatusPolicy,
   acknowledgeDisclosure,
   fetchMyDisclosureAcknowledgements,
@@ -21,6 +23,7 @@ import {
   VAULT_DISCLOSURE_VERSION,
   type VaultDetail,
   type EpochPhase,
+  type VaultExportFormat,
   type DisclosureAcknowledgement,
   type PolicyReasonCode,
 } from "../../../../lib/api/vaults";
@@ -68,6 +71,7 @@ export default function VaultDetailPage({ params }: { params: Promise<{ id: stri
   const [txStatus, setTxStatus] = useState<null | "pending" | "success" | "error">(null);
   const [txMessage, setTxMessage] = useState("");
   const [activeFlow, setActiveFlow] = useState<"deposit" | "withdraw" | null>(null);
+  const [disclosuresAcknowledged, setDisclosuresAcknowledged] = useState(false);
 
   // Disclosure gate. `acks` is null while loading for the connected wallet.
   const [acks, setAcks] = useState<DisclosureAcknowledgement[] | null>(null);
@@ -135,7 +139,7 @@ export default function VaultDetailPage({ params }: { params: Promise<{ id: stri
   };
 
   const handleDeposit = async () => {
-    if (!vault || !token || !address || !currentAck || gateReason || !permittedActions.includes("deposit")) return;
+    if (!vault || !token || !address || !currentAck || gateReason || !disclosuresAcknowledged || !permittedActions.includes("deposit")) return;
     const amount = parseFloat(depositAmount);
     if (isNaN(amount) || amount <= 0) return;
     setTxStatus("pending");
@@ -183,6 +187,17 @@ export default function VaultDetailPage({ params }: { params: Promise<{ id: stri
     } catch (e) {
       setTxStatus("error");
       setTxMessage(e instanceof Error ? e.message : "Withdrawal failed");
+    }
+  };
+
+  const handleExport = async (format: VaultExportFormat) => {
+    if (!vault || !token) return;
+    try {
+      const blob = await fetchVaultExport(vault.id, format, token);
+      downloadBlob(`${vault.id}-lots.${format}`, blob);
+    } catch (e) {
+      setTxStatus("error");
+      setTxMessage(e instanceof Error ? e.message : "Export failed");
     }
   };
 
@@ -378,6 +393,19 @@ export default function VaultDetailPage({ params }: { params: Promise<{ id: stri
                         <span className="num" style={{ fontSize: 11, fontWeight: 600, color: "var(--text-hi)" }}>{s.value}</span>
                       </div>
                     ))}
+                    <div style={{ display: "flex", gap: 8, marginTop: 12 }}>
+                      {(["csv", "json"] as const).map(format => (
+                        <button
+                          key={format}
+                          type="button"
+                          onClick={() => handleExport(format)}
+                          disabled={!token}
+                          style={{ flex: 1, padding: "6px 0", fontSize: 11, fontWeight: 600, border: "1px solid var(--brand)", background: "transparent", color: "var(--brand)", cursor: token ? "pointer" : "not-allowed" }}
+                        >
+                          Export {format.toUpperCase()}
+                        </button>
+                      ))}
+                    </div>
                   </div>
                 )}
 
@@ -498,6 +526,28 @@ export default function VaultDetailPage({ params }: { params: Promise<{ id: stri
                             Deposits during active epochs are queued for the next epoch start.
                           </div>
                         )}
+                        {/* Depositor disclosures: shown and acknowledged before the deposit can be submitted */}
+                        <div style={{ marginBottom: 12, padding: 10, border: "1px solid var(--border-default)", background: "var(--bg-overlay)", fontSize: 10, color: "var(--text-lo)", lineHeight: 1.6 }}>
+                          <div><span style={{ color: "var(--text-mid)" }}>Risk level:</span> {vault.riskRating}</div>
+                          <div><span style={{ color: "var(--text-mid)" }}>Strategy:</span> {vault.description}</div>
+                          <div>
+                            <span style={{ color: "var(--text-mid)" }}>Fees:</span>{" "}
+                            {vault.feeStructure.managementPct}% management annually, {vault.feeStructure.performancePct}% performance
+                          </div>
+                          <div>
+                            Deposits are queued and redemptions are processed through the withdrawal queue at epoch end;
+                            redemption at the final NAV is not guaranteed to match the current share price.
+                          </div>
+                          <label style={{ display: "flex", gap: 6, alignItems: "flex-start", marginTop: 8, color: "var(--text-hi)", cursor: "pointer" }}>
+                            <input
+                              type="checkbox"
+                              checked={disclosuresAcknowledged}
+                              onChange={e => setDisclosuresAcknowledged(e.target.checked)}
+                              style={{ marginTop: 2 }}
+                            />
+                            <span>I have read the risk level, strategy, fees and queue/redemption terms above.</span>
+                          </label>
+                        </div>
                         {gateReason && (
                           <div role="alert" style={{ marginBottom: 10, fontSize: 10, color: "var(--put)", padding: "6px 8px", background: "var(--put-dim)" }}>
                             <strong>{t("depositBlocked")}:</strong> {t(`reason.${gateReason}`)}
@@ -505,7 +555,7 @@ export default function VaultDetailPage({ params }: { params: Promise<{ id: stri
                         )}
                         <button
                           onClick={handleDeposit}
-                          disabled={txStatus === "pending" || !currentAck || !!gateReason || !depositAmount || isNaN(parseFloat(depositAmount)) || parseFloat(depositAmount) <= 0}
+                          disabled={!disclosuresAcknowledged || txStatus === "pending" || !currentAck || !!gateReason || !depositAmount || isNaN(parseFloat(depositAmount)) || parseFloat(depositAmount) <= 0}
                           style={{
                             width: "100%", padding: "10px 0", background: "var(--brand)",
                             color: "var(--bg)", border: "none", fontSize: 13, fontWeight: 700,
@@ -552,50 +602,4 @@ export default function VaultDetailPage({ params }: { params: Promise<{ id: stri
                           disabled={txStatus === "pending" || !withdrawShares || isNaN(parseFloat(withdrawShares)) || parseFloat(withdrawShares) <= 0}
                           style={{
                             width: "100%", padding: "10px 0",
-                            background: "var(--bg-elevated)", border: "1px solid var(--border-default)",
-                            color: "var(--text-hi)", fontSize: 13, fontWeight: 700,
-                            cursor: txStatus === "pending" ? "default" : "pointer",
-                            opacity: txStatus === "pending" ? 0.6 : 1,
-                          }}
-                        >
-                          {txStatus === "pending" ? "Queuing…" : "Queue Withdrawal"}
-                        </button>
-                      </div>
-                    )}
-
-                    {/* TX status */}
-                    {txStatus && txStatus !== "pending" && (
-                      <div style={{
-                        margin: "0 16px 16px",
-                        padding: "8px 12px",
-                        border: `1px solid ${txStatus === "success" ? "var(--call)" : "var(--put)"}`,
-                        background: txStatus === "success" ? "var(--call-dim)" : "var(--put-dim)",
-                        fontSize: 11,
-                        color: txStatus === "success" ? "var(--call)" : "var(--put)",
-                      }}>
-                        {txMessage}
-                      </div>
-                    )}
-                  </div>
-                )}
-
-                {/* Risk disclosure summary */}
-                <div style={{ fontSize: 10, color: "var(--text-lo)", lineHeight: 1.5, padding: "0 4px" }}>
-                  Vault contracts are unaudited. Deposits may be exposed to smart contract risk and
-                  assignment risk. Past returns do not guarantee future results.
-                </div>
-              </div>
-            </div>
-          )}
-
-          {/* Depositor Governance panel (issue #242) */}
-          {vault && (
-            <div style={{ marginTop: 24, border: "1px solid var(--border-default)", background: "var(--bg-raised)", padding: 20 }}>
-              <VaultGovernancePanel vaultId={vault.id} />
-            </div>
-          )}
-        </div>
-      </div>
-    </div>
-  );
-}
+                            background: "var(--bg-elevated
