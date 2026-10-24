@@ -1,3 +1,5 @@
+import { apiGet, apiPost } from "./client";
+
 /**
  * Typed data adapter interface for the Vaults feature.
  *
@@ -6,7 +8,8 @@
  * API is not yet available. This module is unrelated to the margin-collateral
  * vault in `./vault.ts`. When NEXT_PUBLIC_VAULTS=mock (or the env var is absent), the mock
  * implementation below is used. Swap in the real implementation by
- * setting NEXT_PUBLIC_VAULTS=live and implementing `fetchVaultsLive`.
+ * setting NEXT_PUBLIC_VAULTS=live, which calls the backend vault registry
+ * (Zenith-options/backend) through the REST contract below.
  *
  * Backend contract (for when the real API lands):
  *
@@ -684,5 +687,4 @@ const MOCK_VAULTS: VaultDetail[] = [
     feeStructure: { managementPct: 0, performancePct: 10 },
     payoffExplanation: "The vault simultaneously sells an out-of-the-money call spread and a put spread on ETH. Maximum profit is the combined net premium, achieved if ETH expires between the two short strikes. Maximum loss is limited to the spread width minus the premium.",
     historicalEpochs: [
-      { epochNumber: 10, depositStart: "2026-08-25", activeStart: "2026-08-29", settlementDate: "2026-09-28", strike: 3100, expiryDays: 30, premiumCollected: 28, outcome: "expired_worthless", pnlPct: 0.017 },
-      { epochNumber:  9, depositStart: "2026-07-
+      { epochNumber: 10, depositStart: "2026-08-25", activeStart: "2026-08-29", settlementDate: "2026-09-28", strike: 3100, expiryDays: 30, premiumCollected: 28, outcome: "expired_worthless", p
