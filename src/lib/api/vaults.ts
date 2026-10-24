@@ -217,12 +217,82 @@ export interface VaultRoleGrant {
   grantedAt: string;
 }
 
+// ---------------------------------------------------------------------------
+// Lifecycle state machine (see docs/vault-lifecycle.md)
+// ---------------------------------------------------------------------------
+
+export const VAULT_STATUSES = ["draft", "open", "paused", "winding_down", "closed"] as const;
+export type VaultStatus = (typeof VAULT_STATUSES)[number];
+
+/** Funds-affecting user actions gated by vault status. */
+export type VaultAction = "deposit" | "withdraw";
+
+/** Who may trigger a transition. Operator actions are governance-gated (out of scope here). */
+export type VaultActor = "operator" | "guardian" | "system";
+
+export interface VaultTransition {
+  from: VaultStatus;
+  to: VaultStatus;
+  actor: VaultActor;
+}
+
+export const VAULT_TRANSITIONS: readonly VaultTransition[] = [
+  { from: "draft", to: "open", actor: "operator" },
+  { from: "open", to: "paused", actor: "guardian" },
+  { from: "open", to: "winding_down", actor: "operator" },
+  { from: "paused", to: "open", actor: "operator" },
+  { from: "paused", to: "winding_down", actor: "operator" },
+  { from: "winding_down", to: "closed", actor: "system" },
+];
+
+export interface VaultStatusPolicy {
+  label: string;
+  permittedActions: readonly VaultAction[];
+}
+
+export const VAULT_STATUS_POLICY: Record<VaultStatus, VaultStatusPolicy> = {
+  draft:        { label: "Draft",        permittedActions: [] },
+  open:         { label: "Open",         permittedActions: ["deposit", "withdraw"] },
+  paused:       { label: "Paused",       permittedActions: [] },
+  winding_down: { label: "Winding Down", permittedActions: ["withdraw"] },
+  closed:       { label: "Closed",       permittedActions: [] },
+};
+
+/** Read-only fallback for any status this client does not know about. */
+const UNKNOWN_STATUS_POLICY: VaultStatusPolicy = { label: "Unknown", permittedActions: [] };
+
+export function isVaultStatus(status: unknown): status is VaultStatus {
+  return typeof status === "string" && (VAULT_STATUSES as readonly string[]).includes(status);
+}
+
+/** Resolves policy for a raw status string. Unknown statuses are read-only, never actionable. */
+export function vaultStatusPolicy(status: string): VaultStatusPolicy {
+  return isVaultStatus(status) ? VAULT_STATUS_POLICY[status] : UNKNOWN_STATUS_POLICY;
+}
+
+/**
+ * Applies a transition. Re-applying the current status is an idempotent no-op
+ * (`changed: false`, so no history entry is written). Illegal edges or wrong actors throw.
+ */
+export function applyVaultTransition(
+  current: VaultStatus,
+  to: VaultStatus,
+  actor: VaultActor
+): { status: VaultStatus; changed: boolean } {
+  if (current === to) return { status: current, changed: false };
+  const edge = VAULT_TRANSITIONS.find(t => t.from === current && t.to === to);
+  if (!edge) throw new Error(`Illegal vault transition: ${current} → ${to}`);
+  if (edge.actor !== actor) throw new Error(`Actor ${actor} may not move vault ${current} → ${to}`);
+  return { status: to, changed: true };
+}
+
 /** Summary shown on the /vaults listing page. */
 export interface VaultSummary {
   id: string;
   name: string;
   underlying: string;
   strategy: VaultStrategy;
+  status: VaultStatus;
   /** Trailing 12-month APY estimate (0–1, e.g. 0.18 = 18%). */
   apy: number;
   /** APY methodology note shown in tooltip. */
@@ -756,94 +826,4 @@ async function remember<T>(key: string, load: () => Promise<T>): Promise<T> {
     const value = await load();
     lastKnown.set(key, value);
     return value;
-  } catch (err) {
-    if (err instanceof VaultsApiError && err.retryable && lastKnown.has(key)) {
-      return lastKnown.get(key) as T;
-    }
-    throw err;
-  }
-}
-
-const liveVaultsClient: VaultsClient = {
-  listVaults(query, signal) {
-    const path = `${API}${qs({ limit: clampLimit(query?.limit), cursor: query?.cursor })}`;
-    return remember(path, async () => {
-      const page = await request(path, pageOf(VaultRegistryEntrySchema), { signal });
-      return { items: page.items.map(toSummary), nextCursor: page.next_cursor };
-    });
-  },
-
-  getVault(id, signal) {
-    const path = `${API}/${encodeURIComponent(id)}`;
-    return remember(path, async () => {
-      try {
-        return toDetail(await request(path, VaultDetailSchema, { signal }));
-      } catch (err) {
-        if (err instanceof VaultsApiError && err.code === "not_found") return null;
-        throw err;
-      }
-    });
-  },
-
-  getNavHistory(id, query, signal) {
-    const path = `${API}/${encodeURIComponent(id)}/nav${qs({
-      from: query?.from,
-      to: query?.to,
-      limit: clampLimit(query?.limit),
-      cursor: query?.cursor,
-    })}`;
-    return remember(path, async () => {
-      const page = await request(path, pageOf(NavPointSchema), { signal });
-      return { items: page.items.map(toNavPoint), nextCursor: page.next_cursor };
-    });
-  },
-
-  getEpochs(id, query, signal) {
-    const path = `${API}/${encodeURIComponent(id)}/epochs${qs({
-      from: query?.from,
-      to: query?.to,
-      limit: clampLimit(query?.limit),
-      cursor: query?.cursor,
-    })}`;
-    return remember(path, async () => {
-      const page = await request(path, pageOf(EpochRecordSchema), { signal });
-      return { items: page.items.map(toEpoch), nextCursor: page.next_cursor };
-    });
-  },
-
-  async deposit(id, amount, signal) {
-    return request(`${API}/${encodeURIComponent(id)}/deposit`, DepositResponseSchema, {
-      method: "POST",
-      body: { amount: toDecimalString(amount, "amount") },
-      signal,
-    });
-  },
-
-  async withdraw(id, shares, signal) {
-    return request(`${API}/${encodeURIComponent(id)}/withdraw`, WithdrawResponseSchema, {
-      method: "POST",
-      body: { shares: toDecimalString(shares, "shares") },
-      signal,
-    });
-  },
-};
-
-// ---------------------------------------------------------------------------
-// Mock data
-// ---------------------------------------------------------------------------
-
-/** Fixture shape. Queue and fee ledgers are derived in the mock client. */
-type MockVaultRecord = Omit<VaultDetail, "utilisation" | "queue" | "fees">;
-
-const MOCK_VAULTS: MockVaultRecord[] = [
-  {
-    id: "xlm-cc-v1",
-    name: "XLM Covered Call",
-    underlying: "XLM",
-    strategy: "covered_call",
-    apy: 0.22,
-    apyMethodology: "Trailing 12-month annualized premium income ÷ average TVL. Does not include spot price change of the underlying.",
-    tvl: 284000,
-    capacity: 500000,
-    currentStrike: 0.13,
-    currentExpiry: "2026-10
+  } catch (
