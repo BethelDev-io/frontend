@@ -808,4 +808,125 @@ export function unrealizedPnl(lots: VaultShareLot[], markNavPerShare: number): n
 }
 
 /**
- * Replays
+ * Replays lot-affecting events into ledger rows (see docs/vault-lot-ledger.md).
+ */
+
+// ---------------------------------------------------------------------------
+// Storage TTL policy (issue #206)
+//
+// Soroban persistent entries are archived once their live-until ledger passes.
+// An archived depositor share entry cannot be withdrawn until it is restored,
+// so every entry class has an explicit policy and the maintenance planner
+// bumps entries before they reach the minimum. Ledgers close about every 5s,
+// so one day is 17_280 ledgers.
+// ---------------------------------------------------------------------------
+
+export const LEDGERS_PER_DAY = 17_280;
+
+export const TTL_KEY_CLASSES = [
+  "depositor_share",
+  "epoch_record",
+  "deposit_intent",
+  "global_config",
+] as const;
+export type TtlKeyClass = (typeof TTL_KEY_CLASSES)[number];
+
+export interface TtlPolicy {
+  /** Bump an entry whose remaining TTL is below this many ledgers. */
+  minLedgers: number;
+  /** Extend an entry to this many ledgers of remaining TTL. */
+  targetLedgers: number;
+  /** Backend alert when remaining TTL falls below this many ledgers. */
+  warnLedgers: number;
+}
+
+/**
+ * Per-class TTL policy. `global_config` mirrors the instance-storage constants
+ * in `contracts/vault-common` (TTL_THRESHOLD = 30 days, TTL_EXTEND_TO = 60 days).
+ * Per-depositor and epoch entries run on a 30/90-day policy. The 14-day warning
+ * window is well inside the minimum, so an alert means maintenance has stopped.
+ */
+export const TTL_POLICY: Record<TtlKeyClass, TtlPolicy> = {
+  depositor_share: { minLedgers: 30 * LEDGERS_PER_DAY, targetLedgers: 90 * LEDGERS_PER_DAY, warnLedgers: 14 * LEDGERS_PER_DAY },
+  epoch_record:    { minLedgers: 30 * LEDGERS_PER_DAY, targetLedgers: 90 * LEDGERS_PER_DAY, warnLedgers: 14 * LEDGERS_PER_DAY },
+  deposit_intent:  { minLedgers: 30 * LEDGERS_PER_DAY, targetLedgers: 90 * LEDGERS_PER_DAY, warnLedgers: 14 * LEDGERS_PER_DAY },
+  global_config:   { minLedgers: 30 * LEDGERS_PER_DAY, targetLedgers: 60 * LEDGERS_PER_DAY, warnLedgers: 14 * LEDGERS_PER_DAY },
+};
+
+/** A persistent entry as indexed from the chain. */
+export interface TtlEntry {
+  /** Stable identifier, e.g. `share:{vaultId}:{holder}`. Pages are ordered by this. */
+  key: string;
+  keyClass: TtlKeyClass;
+  /** Ledger sequence at which the entry is archived unless bumped. */
+  liveUntilLedger: number;
+}
+
+/** One entry the maintenance pass must extend to `extendTo`. */
+export interface TtlBump {
+  key: string;
+  keyClass: TtlKeyClass;
+  extendTo: number;
+}
+
+export interface TtlMaintenancePage {
+  bumps: TtlBump[];
+  /** Cursor for the next page, or null when the vault has been fully scanned. */
+  nextCursor: number | null;
+}
+
+export function remainingTtl(entry: TtlEntry, currentLedger: number): number {
+  return entry.liveUntilLedger - currentLedger;
+}
+
+/**
+ * Plans one page of the maintenance pass. Entries are sorted by key and read
+ * from `cursor`, so a single call touches at most `pageSize` entries. This keeps
+ * per-transaction resource use bounded and never pays for the whole vault at once.
+ */
+export function planTtlMaintenancePage(
+  entries: readonly TtlEntry[],
+  currentLedger: number,
+  cursor = 0,
+  pageSize = 50,
+): TtlMaintenancePage {
+  const sorted = [...entries].sort((a, b) => a.key.localeCompare(b.key));
+  const page = sorted.slice(cursor, cursor + pageSize);
+  const bumps = page
+    .filter(e => remainingTtl(e, currentLedger) < TTL_POLICY[e.keyClass].minLedgers)
+    .map(e => ({
+      key: e.key,
+      keyClass: e.keyClass,
+      extendTo: currentLedger + TTL_POLICY[e.keyClass].targetLedgers,
+    }));
+  const next = cursor + pageSize;
+  return { bumps, nextCursor: next < sorted.length ? next : null };
+}
+
+/** Entries inside their class warning window. The backend job reports and alerts on these. */
+export function ttlWarnings(
+  entries: readonly TtlEntry[],
+  currentLedger: number,
+): (TtlEntry & { remainingLedgers: number })[] {
+  return entries
+    .map(e => ({ ...e, remainingLedgers: remainingTtl(e, currentLedger) }))
+    .filter(e => e.remainingLedgers < TTL_POLICY[e.keyClass].warnLedgers);
+}
+
+/**
+ * Matches the RPC simulation error for an archived entry. The pattern is not
+ * verified against a live RPC. Confirm it before relying on the restore path.
+ */
+const ARCHIVED_ENTRY_PATTERN = /ENTRY_ARCHIVED|entry (?:is )?archived|restorePreamble/i;
+
+export function isArchivedEntryError(err: unknown): boolean {
+  const message = err instanceof Error ? err.message : typeof err === "string" ? err : "";
+  return ARCHIVED_ENTRY_PATTERN.test(message);
+}
+
+/**
+ * User-facing message for an archived entry. The backend restores the entry
+ * before surfacing this, so the user only needs to retry.
+ */
+export const ARCHIVED_RESTORED_MESSAGE =
+  "Vault state was archived and has been restored. Please retry your request.";
